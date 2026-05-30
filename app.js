@@ -1,0 +1,931 @@
+/* ==========================================================================
+ * Nutrient Balancer — UI, totals, charts, and swap optimizer
+ * Depends on foods.js (FOODS, DAILY_VALUES, MACRO_KEYS, MICRO_KEYS, LIMIT_KEYS)
+ * ======================================================================== */
+
+"use strict";
+
+const ALL_KEYS = [...MACRO_KEYS, ...MICRO_KEYS, ...FAT_KEYS, ...CAROT_KEYS, ...LIMIT_KEYS];
+
+// ---------------------------------------------------------------------------
+// Nutrient math
+// ---------------------------------------------------------------------------
+
+// Nutrient contribution of `grams` of FOODS[idx], as a key->amount object.
+function contribution(idx, grams) {
+  const food = FOODS[idx];
+  const factor = grams / 100;
+  const out = {};
+  for (const k of [...ALL_KEYS, "kcal"]) out[k] = (food[k] || 0) * factor;
+  return out;
+}
+
+// Sum a list of meal items into total nutrients.
+function totals(mealList) {
+  const sum = {};
+  for (const k of [...ALL_KEYS, "kcal"]) sum[k] = 0;
+  for (const m of mealList) {
+    const c = contribution(m.foodIndex, m.grams);
+    for (const k in c) sum[k] += c[k];
+  }
+  return sum;
+}
+
+// Per-day averages = totals / days.
+function perDay(sum, days) {
+  const out = {};
+  for (const k in sum) out[k] = sum[k] / days;
+  return out;
+}
+
+// Fraction of DV achieved for a nutrient key (1.0 = 100%).
+function dvFraction(daily, key) {
+  const dv = DAILY_VALUES[key].dv;
+  return dv ? daily[key] / dv : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Optimizer
+//   Greedy iso-caloric swaps. For each candidate swap we replace a logged food
+//   with a database food at a calorie-matched serving (capped to a realistic
+//   amount), recompute the FULL daily totals, and score how much the swap
+//   closes the gap on deficient micronutrients without overshooting limits.
+// ---------------------------------------------------------------------------
+
+const MAX_SERVING_G = 250;     // realistic upper bound for a swapped-in food
+const MAX_SWAPS = 5;           // how many swaps to recommend
+const DEFICIT_EPS = 0.999;     // treat >=99.9% DV as "met"
+const SUM_KEYS = [...ALL_KEYS, "kcal"];
+
+// Foods you can LOG freely, but that make poor RECOMMENDATIONS — engineered/
+// fortified/prepared items (bars, fortified cereals, sweets, fast food) that
+// "win" the math without being meaningful whole-food advice, plus dehydrated/
+// powdered items that are unrealistic at a 250 g serving. We keep these OUT of
+// the swap-candidate pool so suggestions are genuine nutrient-dense whole foods.
+const EXCLUDED_GROUPS = new Set([
+  "Spices and Herbs", "Baby Foods", "Soups, Sauces, and Gravies",
+  "Breakfast Cereals", "Beverages", "Baked Products", "Sweets",
+  "Fast Foods", "Meals, Entrees, and Side Dishes", "Snacks",
+  "Restaurant Foods", "Branded Food Products Database",
+  "Quality Control Materials", "Alcoholic Beverages",
+]);
+const EXCLUDE_NAME_RE =
+  /powder|dried|dehydrated|\bdry\b|infant formula|formula,|leavening|, mix\b|\bmix,|formulated|fortified|concentrate|freeze[- ]dried|extract|bouillon|baby ?food/i;
+
+// To keep recommendations to foods people actually eat (not grape leaves,
+// dandelion greens, lambsquarters, emu…), a candidate's primary food noun must
+// be in this everyday-foods set. USDA names foods "Noun, qualifier…" (and fish
+// as "Fish, salmon…"), so we check the first or second comma-segment. Animal
+// nouns (beef, chicken…) pull in their cuts AND organ meats. You can still LOG
+// any of the 7,793 foods — this only constrains what gets *suggested*.
+const COMMON_NOUNS = new Set([
+  // meat & poultry
+  "beef","chicken","pork","turkey","lamb","veal","ham","bacon","sausage","duck",
+  // seafood
+  "salmon","tuna","cod","halibut","trout","tilapia","herring","sardine","mackerel",
+  "catfish","haddock","pollock","snapper","bass","flounder","sole","anchovy",
+  "shrimp","crab","lobster","oyster","clam","mussel","scallop","squid",
+  // eggs & dairy
+  "egg","milk","yogurt","cheese","butter","cream","kefir",
+  // legumes & soy
+  "bean","lentil","chickpea","pea","soybean","tofu","edamame","hummus","peanut",
+  // nuts & seeds
+  "nut","almond","walnut","cashew","pecan","pistachio","hazelnut","macadamia",
+  "seed","sesame","chia","flaxseed","flax",
+  // grains
+  "rice","oat","quinoa","barley","buckwheat","bread","pasta","noodle","wheat",
+  "cornmeal","couscous","millet","bulgur","tortilla","oatmeal",
+  // vegetables
+  "spinach","kale","broccoli","cauliflower","cabbage","lettuce","carrot","potato",
+  "sweet potato","tomato","pepper","onion","garlic","mushroom","asparagus",
+  "brussels sprouts","celery","cucumber","zucchini","squash","pumpkin","beet",
+  "beet greens","collards","turnip greens","mustard greens","chard","corn","peas",
+  "artichoke","eggplant","okra","radish","yam","leek","sprouts","kohlrabi","parsnip",
+  // fruits
+  "apple","banana","orange","strawberry","blueberry","raspberry","blackberry",
+  "grape","grapefruit","lemon","lime","mango","pineapple","peach","pear","plum",
+  "cherry","watermelon","cantaloupe","melon","kiwi","apricot","fig","date",
+  "pomegranate","papaya","avocado","raisin","cranberry","tangerine","nectarine",
+]);
+
+function commonStem(seg) {
+  if (COMMON_NOUNS.has(seg)) return true;
+  if (seg.endsWith("ies") && COMMON_NOUNS.has(seg.slice(0, -3) + "y")) return true;
+  if (seg.endsWith("es") && COMMON_NOUNS.has(seg.slice(0, -2))) return true;
+  if (seg.endsWith("s") && COMMON_NOUNS.has(seg.slice(0, -1))) return true;
+  return false;
+}
+
+function isCommonFood(food) {
+  const lc = food._lc || (food._lc = food.name.toLowerCase());
+  const segs = food._segs || (food._segs = lc.split(",").map(s => s.trim()));
+  // segment 1 or 2 ("Chicken, …", "Fish, salmon, …"). The first-word fallback is
+  // applied ONLY when a parenthetical comma split the first segment (e.g.
+  // "Chickpeas (garbanzo beans, bengal gram), …") — not for multi-word segments
+  // like "grape leaves" (which shouldn't match on "grape").
+  return commonStem(segs[0]) ||
+    (segs.length > 1 && commonStem(segs[1])) ||
+    (segs[0].includes("(") && commonStem(lc.split(/[\s,]/)[0]));
+}
+
+function isRecommendable(food) {
+  return food.kcal > 0 &&
+    !EXCLUDED_GROUPS.has(food.group) &&
+    !EXCLUDE_NAME_RE.test(food.name) &&
+    isCommonFood(food);
+}
+
+// Precompute the candidate pool once (FOODS is available from foods.js).
+const SWAP_CANDIDATES = FOODS.reduce((a, f, i) => {
+  if (isRecommendable(f)) a.push(i);
+  return a;
+}, []);
+
+// total ± a food's contribution, returning a fresh object.
+function addScaled(total, idx, grams, sign) {
+  const f = FOODS[idx], factor = (grams / 100) * sign, out = {};
+  for (const k of SUM_KEYS) out[k] = total[k] + (f[k] || 0) * factor;
+  return out;
+}
+
+// Penalty score for a daily profile: how far below DV across micros (capped),
+// plus penalties for exceeding calorie target and sodium limit.
+function deficiencyScore(daily, days, kcalTarget) {
+  let score = 0;
+  for (const k of MICRO_KEYS) {
+    const frac = dvFraction(daily, k);
+    if (frac < 1) score += (1 - frac);          // reward closing the gap
+  }
+  // Sodium limit (per day): penalize going over.
+  const naFrac = daily.na / DAILY_VALUES.na.dv;
+  if (naFrac > 1) score += (naFrac - 1) * 2;
+  // Calorie budget: penalize drifting from target (soft).
+  if (kcalTarget > 0) {
+    const kcalDaily = daily.kcal;
+    score += Math.abs(kcalDaily - kcalTarget) / kcalTarget * 0.5;
+  }
+  return score;
+}
+
+function deficientMicros(daily) {
+  return MICRO_KEYS.filter(k => dvFraction(daily, k) < DEFICIT_EPS);
+}
+
+// Produce a sequence of recommended swaps. Returns { swaps, finalMeals }.
+function optimize(baseMeals, days) {
+  let working = baseMeals.map(m => ({ ...m }));
+  let total = totals(working);                       // running totals (whole period)
+  const kcalTarget = total.kcal / days;              // keep daily calories steady
+  const swaps = [];
+  const swapped = new Set();                         // logged positions already swapped
+
+  for (let step = 0; step < MAX_SWAPS; step++) {
+    const dailyNow = perDay(total, days);
+    if (deficientMicros(dailyNow).length === 0) break;
+    const scoreNow = deficiencyScore(dailyNow, days, kcalTarget);
+
+    let best = null; // { mealPos, addIdx, addGrams, newScore }
+
+    for (let pos = 0; pos < working.length; pos++) {
+      if (swapped.has(pos)) continue;  // each logged food is swapped at most once
+      const item = working[pos];
+      const removedKcal = (FOODS[item.foodIndex].kcal * item.grams) / 100;
+      // totals with this logged item removed (computed once per position).
+      const without = addScaled(total, item.foodIndex, item.grams, -1);
+
+      for (const addIdx of SWAP_CANDIDATES) {
+        if (addIdx === item.foodIndex) continue;
+        const addFood = FOODS[addIdx];
+
+        // Calorie-matched serving, capped to a realistic amount.
+        let grams = removedKcal > 0 ? (removedKcal / addFood.kcal) * 100 : 100;
+        grams = Math.max(20, Math.min(MAX_SERVING_G, grams));
+
+        const trialTotal = addScaled(without, addIdx, grams, +1);
+        const trialScore = deficiencyScore(perDay(trialTotal, days), days, kcalTarget);
+
+        if (trialScore < scoreNow - 1e-6 &&
+            (!best || trialScore < best.newScore)) {
+          best = { mealPos: pos, addIdx, addGrams: grams, newScore: trialScore };
+        }
+      }
+    }
+
+    if (!best) break; // no swap improves things further
+
+    const removed = working[best.mealPos];
+    const beforeDaily = perDay(total, days);
+    total = addScaled(addScaled(total, removed.foodIndex, removed.grams, -1),
+                      best.addIdx, best.addGrams, +1);
+    working[best.mealPos] = { foodIndex: best.addIdx, grams: best.addGrams };
+    swapped.add(best.mealPos);
+    const afterDaily = perDay(total, days);
+
+    swaps.push({
+      removeFood: FOODS[removed.foodIndex].name,
+      removeGrams: Math.round(removed.grams),
+      addFood: FOODS[best.addIdx].name,
+      addGrams: Math.round(best.addGrams),
+      before: beforeDaily,
+      after: afterDaily,
+    });
+  }
+
+  return { swaps, finalMeals: working };
+}
+
+// A food's "nutrient signature" = its 3 richest micronutrients (per 100 g, as a
+// fraction of DV). Foods sharing a signature are near-duplicates for swap
+// purposes (e.g. every animal liver is B12/A/copper), so we dedupe on it to
+// keep the replacement list diverse.
+function foodSig(food) {
+  if (food._sig) return food._sig;
+  const ranked = MICRO_KEYS
+    .map(k => [k, (food[k] || 0) / DAILY_VALUES[k].dv])
+    .sort((a, b) => b[1] - a[1]);
+  return (food._sig = ranked.slice(0, 2).map(x => x[0]).sort().join(","));
+}
+
+// Top-N calorie-matched replacements for the food at `pos`, ranked by how much
+// each improves the WHOLE-diet balance (other foods held fixed), then DEDUPED
+// by nutrient signature for variety. Each result carries the calorie-matched
+// grams and a short "biggest gain" label.
+function topReplacements(meals, pos, days, n = 10) {
+  const baseTotal = totals(meals);
+  const baseDaily = perDay(baseTotal, days);
+  const kcalTarget = baseTotal.kcal / days;
+  const scoreNow = deficiencyScore(baseDaily, days, kcalTarget);
+  const item = meals[pos];
+  const removedKcal = (FOODS[item.foodIndex].kcal * item.grams) / 100;
+  const without = addScaled(baseTotal, item.foodIndex, item.grams, -1);
+
+  const cands = [];
+  for (const addIdx of SWAP_CANDIDATES) {
+    if (addIdx === item.foodIndex) continue;
+    let grams = removedKcal > 0 ? (removedKcal / FOODS[addIdx].kcal) * 100 : 100;
+    grams = Math.max(20, Math.min(MAX_SERVING_G, grams));
+    const trialTotal = addScaled(without, addIdx, grams, +1);
+    const improvement = scoreNow - deficiencyScore(perDay(trialTotal, days), days, kcalTarget);
+    cands.push({ addIdx, grams, improvement });
+  }
+  cands.sort((a, b) => b.improvement - a.improvement);
+  const top = [], seen = new Set();
+  for (const cand of cands) {
+    if (top.length >= n) break;
+    const sig = foodSig(FOODS[cand.addIdx]);
+    if (seen.has(sig)) continue;     // skip near-duplicate nutrient profiles
+    seen.add(sig);
+    top.push(cand);
+  }
+
+  // Annotate each with its single biggest micronutrient gain.
+  for (const cand of top) {
+    const trialDaily = perDay(addScaled(without, cand.addIdx, cand.grams, +1), days);
+    let bestK = null, bestD = 0;
+    for (const k of MICRO_KEYS) {
+      const d = dvFraction(trialDaily, k) - dvFraction(baseDaily, k);
+      if (d > bestD) { bestD = d; bestK = k; }
+    }
+    cand.gainText = bestK ? `+${Math.round(bestD * 100)}% ${DAILY_VALUES[bestK].label}` : "";
+  }
+  return top;
+}
+
+// ---------------------------------------------------------------------------
+// SVG chart helpers (no external chart library — works fully offline)
+// ---------------------------------------------------------------------------
+
+const MACRO_COLORS = { p: "#4e79a7", c: "#f28e2b", f: "#e15759" };
+
+// Distinct colors assigned to each logged food, consistent across all charts.
+const FOOD_COLORS = ["#4e79a7","#f28e2b","#59a14f","#e15759","#76b7b2","#edc948",
+  "#b07aa1","#ff9da7","#9c755f","#86bcb6","#d37295","#8cd17d","#b6992d","#499894"];
+const colorFor = i => FOOD_COLORS[i % FOOD_COLORS.length];
+
+// Per-day nutrient contribution of each logged meal item (sums to `daily`).
+function perFoodContribs(mealList, days) {
+  return mealList.map(m => {
+    const c = contribution(m.foodIndex, m.grams);
+    const o = {};
+    for (const k of [...ALL_KEYS, "kcal"]) o[k] = c[k] / days;
+    return o;
+  });
+}
+
+// Shared color legend mapping each food to its swatch.
+function foodLegend(mealList, title = "Your foods (chart colors)") {
+  const rows = mealList.map((m, i) => {
+    const amt = m.mult > 1
+      ? `${Math.round(m.baseGrams)} g ×${m.mult} = ${Math.round(m.grams)} g`
+      : `${Math.round(m.grams)} g`;
+    return `<span class="food-chip"><span class="swatch" style="background:${colorFor(i)}"></span>` +
+      `${escapeHtml(FOODS[m.foodIndex].name)} <span class="muted">(${amt})</span></span>`;
+  }).join("");
+  return `<div class="food-legend"><div class="legend-title">${title}</div>${rows}</div>`;
+}
+
+// Stacked horizontal bars showing each food's share of every macro (in grams).
+function macroBars(mealList, perFood, daily) {
+  const macros = [["p","Protein"],["c","Carbs"],["f","Fat"],["fib","Fiber"]];
+  const rowH = 30, labelW = 70, barW = 300, valW = 120, padTop = 6;
+  const fullW = labelW + barW + valW, h = padTop + macros.length * rowH;
+  let svg = "";
+  macros.forEach(([k, label], r) => {
+    const total = daily[k] || 0;
+    const y = padTop + r * rowH;
+    svg += `<text x="0" y="${y + 17}" class="bar-label" text-anchor="start">${label}</text>` +
+           `<rect x="${labelW}" y="${y + 4}" width="${barW}" height="16" fill="#eef0f3" rx="2"/>`;
+    let x = labelW;
+    if (total > 0) {
+      mealList.forEach((m, i) => {
+        const v = perFood[i][k];
+        if (v <= 0) return;
+        const w = (v / total) * barW;
+        svg += `<rect x="${x.toFixed(1)}" y="${y + 4}" width="${w.toFixed(1)}" height="16" fill="${colorFor(i)}">` +
+               `<title>${escapeHtml(FOODS[m.foodIndex].name)}: ${fmt(v)} g (${Math.round(v / total * 100)}% of ${label.toLowerCase()})</title></rect>`;
+        x += w;
+      });
+    }
+    const pct = Math.round(dvFraction(daily, k) * 100);
+    svg += `<text x="${labelW + barW + 8}" y="${y + 17}" class="bar-pct">${fmt(total)} g · ${pct}% DV</text>`;
+  });
+  return `<svg viewBox="0 0 ${fullW} ${h}" width="100%" preserveAspectRatio="xMinYMin meet" role="img">${svg}</svg>`;
+}
+
+// Stacked-by-food bars for a set of nutrient keys. Each bar is scaled to its own
+// total so you can see which foods supply it (e.g. omega-3 from the salmon).
+// Right-side text gives the amount + reference target (DV / AI / limit) if one
+// exists, else just the amount (e.g. carotenoids, which have no DV).
+function stackedNutrientBars(keys, mealList, perFood, daily) {
+  const rowH = 30, labelW = 130, barW = 250, valW = 150, padTop = 6;
+  const fullW = labelW + barW + valW, h = padTop + keys.length * rowH;
+  let svg = "";
+  keys.forEach((k, r) => {
+    const meta = DAILY_VALUES[k], total = daily[k] || 0, y = padTop + r * rowH;
+    svg += `<text x="0" y="${y + 17}" class="bar-label" text-anchor="start">${meta.label}</text>` +
+           `<rect x="${labelW}" y="${y + 4}" width="${barW}" height="16" fill="#eef0f3" rx="2"/>`;
+    let x = labelW;
+    if (total > 0) {
+      mealList.forEach((m, i) => {
+        const v = perFood[i][k];
+        if (v <= 0) return;
+        const w = (v / total) * barW;
+        svg += `<rect x="${x.toFixed(1)}" y="${y + 4}" width="${w.toFixed(1)}" height="16" fill="${colorFor(i)}">` +
+               `<title>${escapeHtml(FOODS[m.foodIndex].name)}: ${fmt(v)} ${meta.unit} (${Math.round(v / total * 100)}% of ${meta.label.toLowerCase()})</title></rect>`;
+        x += w;
+      });
+    }
+    // reference text: % of DV/AI when a target exists, else just the amount
+    let ref = `${fmt(total)} ${meta.unit}`;
+    if (meta.dv) {
+      const pct = Math.round(total / meta.dv * 100);
+      ref += meta.limit ? ` · ${pct}% of ${meta.dv} ${meta.unit} limit`
+                        : ` · ${pct}% of ${meta.dv} ${meta.unit} AI`;
+    }
+    svg += `<text x="${labelW + barW + 8}" y="${y + 17}" class="bar-pct">${ref}</text>`;
+  });
+  return `<svg viewBox="0 0 ${fullW} ${h}" width="100%" preserveAspectRatio="xMinYMin meet" role="img">${svg}</svg>`;
+}
+
+function macroPie(daily) {
+  // Calories from each macro (protein 4, carb 4, fat 9 kcal/g).
+  const parts = [
+    { key: "p", label: "Protein", kcal: daily.p * 4 },
+    { key: "c", label: "Carbs",   kcal: daily.c * 4 },
+    { key: "f", label: "Fat",     kcal: daily.f * 9 },
+  ];
+  const total = parts.reduce((s, p) => s + p.kcal, 0) || 1;
+  const cx = 110, cy = 110, r = 100;
+  let angle = -Math.PI / 2;
+  let paths = "";
+  let legend = "";
+  for (const p of parts) {
+    const frac = p.kcal / total;
+    const end = angle + frac * 2 * Math.PI;
+    const x1 = cx + r * Math.cos(angle), y1 = cy + r * Math.sin(angle);
+    const x2 = cx + r * Math.cos(end),   y2 = cy + r * Math.sin(end);
+    const large = frac > 0.5 ? 1 : 0;
+    paths += `<path d="M${cx},${cy} L${x1.toFixed(1)},${y1.toFixed(1)} ` +
+             `A${r},${r} 0 ${large},1 ${x2.toFixed(1)},${y2.toFixed(1)} Z" ` +
+             `fill="${MACRO_COLORS[p.key]}" stroke="#fff" stroke-width="2"/>`;
+    legend += `<div class="legend-row"><span class="swatch" style="background:${MACRO_COLORS[p.key]}"></span>` +
+              `${p.label}: ${Math.round(daily[p.key])} g (${Math.round(frac * 100)}% of kcal)</div>`;
+    angle = end;
+  }
+  return `<div class="chart-flex">
+      <svg viewBox="0 0 220 220" width="220" height="220" role="img">${paths}</svg>
+      <div class="legend">
+        <div class="legend-title">${Math.round(total)} kcal/day from macros</div>
+        ${legend}
+        <div class="legend-row muted">Fiber: ${Math.round(daily.fib)} g/day (DV ${DAILY_VALUES.fib.dv} g)</div>
+      </div>
+    </div>`;
+}
+
+// Each bar is scaled so 100% DV sits at a fixed reference line; the filled
+// portion is split into per-food segments (colored consistently with the
+// legend). Bar caps at 150% DV for layout.
+function microBars(daily, mealList, perFood) {
+  const rowH = 26, labelW = 130, barW = 320, padTop = 8, scale = barW / 1.5;
+  const h = padTop + MICRO_KEYS.length * rowH + 24;
+  const fullW = labelW + barW + 70;
+  let rows = "";
+  MICRO_KEYS.forEach((k, i) => {
+    const frac = dvFraction(daily, k);
+    const y = padTop + i * rowH;
+    const total = daily[k] || 0;
+    const visW = Math.min(frac, 1.5) * scale;   // total filled width (capped at 150%)
+    const unit = DAILY_VALUES[k].unit;
+    rows += `<text x="${labelW - 6}" y="${y + 16}" text-anchor="end" class="bar-label">${DAILY_VALUES[k].label}</text>` +
+            `<rect x="${labelW}" y="${y + 4}" width="${barW / 1.5}" height="16" fill="#eef0f3"/>`;
+    let x = labelW;
+    if (total > 0) {
+      mealList.forEach((m, fi) => {
+        const v = perFood[fi][k];
+        if (v <= 0) return;
+        const w = (v / total) * visW;           // this food's share of the visible bar
+        rows += `<rect x="${x.toFixed(1)}" y="${y + 4}" width="${w.toFixed(1)}" height="16" fill="${colorFor(fi)}">` +
+                `<title>${escapeHtml(FOODS[m.foodIndex].name)}: ${fmt(v)} ${unit} (${Math.round(v / total * 100)}% of ${DAILY_VALUES[k].label})</title></rect>`;
+        x += w;
+      });
+    }
+    const pctClass = frac >= DEFICIT_EPS ? "bar-pct met" : "bar-pct";
+    rows += `<text x="${labelW + barW / 1.5 + 8}" y="${y + 16}" class="${pctClass}">${Math.round(frac * 100)}%</text>`;
+  });
+  const lineX = labelW + scale;
+  rows += `<line x1="${lineX}" y1="${padTop}" x2="${lineX}" y2="${padTop + MICRO_KEYS.length * rowH}"
+            stroke="#333" stroke-width="1.5" stroke-dasharray="4 3"/>
+           <text x="${lineX}" y="${padTop + MICRO_KEYS.length * rowH + 16}" text-anchor="middle" class="bar-pct">100% DV</text>`;
+  return `<svg viewBox="0 0 ${fullW} ${h}" width="100%" preserveAspectRatio="xMinYMin meet" role="img">${rows}</svg>`;
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+function fmt(n) { return n >= 100 ? Math.round(n) : Math.round(n * 10) / 10; }
+
+// Read every meal row in the DOM into a [{foodIndex, grams}] list.
+// Each row stores its resolved food index in data-idx (set when the user
+// picks a value that matches a food name).
+function collectMeals() {
+  const out = [];
+  const unknown = [];
+  document.querySelectorAll(".meal-row").forEach(row => {
+    const search = row.querySelector(".food-search");
+    const baseGrams = Number(row.querySelector(".grams").value);
+    const mult = Number(row.querySelector(".mult").value) || 1;   // blank → ×1
+    const grams = baseGrams * mult;                                // effective total
+    const name = search.value.trim();
+    if (!name && !(grams > 0)) return;       // blank row, ignore
+    const idx = NAME_TO_INDEX.has(name) ? NAME_TO_INDEX.get(name)
+                                        : Number(row.dataset.idx);
+    if (!(idx >= 0) || !Number.isInteger(idx) || !FOODS[idx]) { unknown.push(name || "(empty)"); return; }
+    if (grams > 0) out.push({ foodIndex: idx, grams, baseGrams, mult });
+  });
+  if (unknown.length) {
+    alert("These entries don't match a food in the database (pick from the dropdown):\n• " +
+          unknown.join("\n• "));
+  }
+  return out;
+}
+
+function renderResults() {
+  const days = Math.max(1, Number(document.getElementById("days").value) || 1);
+  const meals = collectMeals();
+  if (meals.length === 0) {
+    alert("Add at least one food (with a serving size in grams) first.");
+    return;
+  }
+  const daily = perDay(totals(meals), days);
+  const perFood = perFoodContribs(meals, days);
+  const results = document.getElementById("results");
+
+  // Summary line
+  const naPct = Math.round(daily.na / DAILY_VALUES.na.dv * 100);
+  let html = `
+    <h2>Daily average over ${days} day${days > 1 ? "s" : ""}</h2>
+    <p class="muted">${Math.round(daily.kcal)} kcal/day · Sodium ${Math.round(daily.na)} mg (${naPct}% of ${DAILY_VALUES.na.dv} mg limit)</p>
+    <div class="card">${foodLegend(meals)}<p class="muted" style="margin:0 0 4px">Hover any segment for the exact amount.</p></div>
+    <div class="card"><h3>Macronutrients</h3>${macroPie(daily)}
+      <h4 class="sub">Where each macro comes from</h4>${macroBars(meals, perFood, daily)}</div>
+    <div class="card"><h3>Micronutrients vs. Daily Value</h3>${microBars(daily, meals, perFood)}</div>
+    <div class="card"><h3>Fats &amp; fatty acids</h3>${stackedNutrientBars(FAT_KEYS, meals, perFood, daily)}
+      <p class="muted" style="margin:8px 0 0">Omega-3/6 use IOM Adequate Intakes (no FDA Daily Value exists); saturated fat &amp; cholesterol are upper limits.</p></div>
+    <div class="card"><h3>Carotenoids (phytonutrients)</h3>${stackedNutrientBars(CAROT_KEYS, meals, perFood, daily)}
+      <p class="muted" style="margin:8px 0 0">No Daily Value exists for these; shown as amounts. Beta-carotene also counts toward vitamin A (already included above).</p></div>
+    <div class="card" id="swapExplorer"></div>`;
+
+  // Optimizer
+  const deficient = deficientMicros(daily);
+  html += `<div class="card"><h3>Recommendations</h3>`;
+  if (deficient.length === 0) {
+    html += `<p class="ok">🎉 You're at or above 100% DV for all tracked micronutrients. Nice balance!</p>`;
+  } else {
+    html += `<p>Below 100% DV: <strong>${deficient.map(k => DAILY_VALUES[k].label).join(", ")}</strong>.</p>`;
+    const { swaps, finalMeals } = optimize(meals, days);
+    if (swaps.length === 0) {
+      html += `<p class="muted">No single-food swap in the database improves your coverage without overshooting calorie/sodium limits. Consider adding a serving of a nutrient-dense food (e.g. beef liver, oysters, sardines, spinach, pumpkin seeds, fortified cereal).</p>`;
+    } else {
+      html += `<p>Suggested calorie-matched swaps (applied in order, recomputing totals each time):</p><ol class="swaps">`;
+      for (const s of swaps) {
+        const gains = MICRO_KEYS
+          .map(k => ({ k, d: dvFraction(s.after, k) - dvFraction(s.before, k) }))
+          .filter(x => x.d > 0.03)
+          .sort((a, b) => b.d - a.d).slice(0, 4)
+          .map(x => `${DAILY_VALUES[x.k].label} +${Math.round(x.d * 100)}%`).join(", ");
+        html += `<li>Swap <strong>${s.removeGrams} g ${s.removeFood}</strong> →
+                 <strong>${s.addGrams} g ${s.addFood}</strong>
+                 ${gains ? `<br><span class="muted">gains: ${gains}</span>` : ""}</li>`;
+      }
+      html += `</ol>`;
+      const finalDaily = perDay(totals(finalMeals), days);
+      const finalPerFood = perFoodContribs(finalMeals, days);
+      const stillLow = deficientMicros(finalDaily);
+      html += `<p class="muted">After these swaps: ${MICRO_KEYS.length - stillLow.length}/${MICRO_KEYS.length} micros at 100%+ DV` +
+        (stillLow.length ? `; still low: ${stillLow.map(k => DAILY_VALUES[k].label).join(", ")}.` : `. All targets met!`) + `</p>`;
+      html += `<details><summary>Projected micronutrient chart after swaps</summary>` +
+        `${foodLegend(finalMeals, "Foods after swaps")}${microBars(finalDaily, finalMeals, finalPerFood)}</details>`;
+    }
+  }
+  html += `</div>`;
+
+  results.innerHTML = html;
+  mountSwapExplorer(meals, days);
+  results.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// Interactive "What If I Swapped" explorer: a replacement dropdown per food and
+// a live balance preview that updates as the user combines choices.
+function mountSwapExplorer(meals, days) {
+  const box = document.getElementById("swapExplorer");
+  if (!box) return;
+  const baseDaily = perDay(totals(meals), days);
+  const baseMet = MICRO_KEYS.length - deficientMicros(baseDaily).length;
+  const selection = {};                       // pos -> { addIdx, grams } or absent
+  const replacementsByPos = meals.map((_, pos) => topReplacements(meals, pos, days, 10));
+
+  box.innerHTML = `<h3>What If I Swapped…</h3>
+    <p class="muted">Pick a replacement for any food to preview the new balance. Combine as many as you like — calorie-matched servings.</p>
+    <div class="swap-controls"></div>
+    <div class="swap-preview"></div>`;
+  const controls = box.querySelector(".swap-controls");
+  const preview = box.querySelector(".swap-preview");
+
+  meals.forEach((m, pos) => {
+    const ctl = document.createElement("div");
+    ctl.className = "swap-ctl";
+    const opts = [`<option value="">Keep — ${escapeHtml(FOODS[m.foodIndex].name)} (${Math.round(m.grams)} g)</option>`]
+      .concat(replacementsByPos[pos].map((c, i) =>
+        `<option value="${i}">→ ${escapeHtml(FOODS[c.addIdx].name)} (${Math.round(c.grams)} g)` +
+        `${c.gainText ? ` · ${c.gainText}` : ""}</option>`));
+    ctl.innerHTML =
+      `<span class="swatch" style="background:${colorFor(pos)}"></span>` +
+      `<select class="swap-select" data-pos="${pos}">${opts.join("")}</select>`;
+    controls.appendChild(ctl);
+    ctl.querySelector("select").addEventListener("change", e => {
+      const i = e.target.value;
+      if (i === "") delete selection[pos];
+      else selection[pos] = replacementsByPos[pos][Number(i)];
+      updatePreview();
+    });
+  });
+
+  function updatePreview() {
+    const newMeals = meals.map((m, i) =>
+      selection[i] ? { foodIndex: selection[i].addIdx, grams: selection[i].grams } : m);
+    const newDaily = perDay(totals(newMeals), days);
+    const perFood = perFoodContribs(newMeals, days);
+    const met = MICRO_KEYS.length - deficientMicros(newDaily).length;
+    const nSwaps = Object.keys(selection).length;
+    const naPct = Math.round(newDaily.na / DAILY_VALUES.na.dv * 100);
+    const metDelta = met === baseMet ? `${met}/${MICRO_KEYS.length}`
+      : `${baseMet} → <strong>${met}</strong>/${MICRO_KEYS.length}`;
+    preview.innerHTML =
+      `<p class="muted" style="margin:14px 0 6px">${nSwaps ? `Previewing ${nSwaps} swap${nSwaps > 1 ? "s" : ""}` : "No swaps selected (showing your current balance)"} — ` +
+      `${Math.round(newDaily.kcal)} kcal/day · Sodium ${naPct}% · micros at 100% DV: ${metDelta}</p>` +
+      foodLegend(newMeals, "Foods in this scenario") +
+      microBars(newDaily, newMeals, perFood);
+  }
+  updatePreview();
+}
+
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+
+// Grouped <option> markup for the food <select>, built once.
+// Map of exact food name -> index, for resolving typed/picked values.
+const NAME_TO_INDEX = new Map();
+FOODS.forEach((f, i) => { if (!NAME_TO_INDEX.has(f.name)) NAME_TO_INDEX.set(f.name, i); });
+
+// --- Search ranking: surface whole/basic foods before niche/branded ones ----
+// Lower tier = more "basic whole food" → shown first.
+const GROUP_TIER = {};
+[
+  ["Dairy and Egg Products",0], ["Poultry Products",0], ["Fruits and Fruit Juices",0],
+  ["Vegetables and Vegetable Products",0], ["Beef Products",0], ["Pork Products",0],
+  ["Finfish and Shellfish Products",0], ["Legumes and Legume Products",0],
+  ["Lamb, Veal, and Game Products",0], ["Nut and Seed Products",0],
+  ["Cereal Grains and Pasta",0], ["Fats and Oils",0],
+  ["Breakfast Cereals",1], ["Soups, Sauces, and Gravies",1],
+  ["Sausages and Luncheon Meats",1], ["Baked Products",1], ["Spices and Herbs",1],
+  ["American Indian/Alaska Native Foods",1], ["Beverages",1], ["Alcoholic Beverages",1],
+  ["Sweets",2], ["Snacks",2], ["Meals, Entrees, and Side Dishes",2], ["Fast Foods",2],
+  ["Restaurant Foods",2], ["Branded Food Products Database",2], ["Baby Foods",2],
+  ["Quality Control Materials",3],
+].forEach(([g, t]) => { GROUP_TIER[g] = t; });
+const tierOf = f => (f.group in GROUP_TIER ? GROUP_TIER[f.group] : 2);
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+}
+
+// In USDA naming, a canonical whole food is "Noun, qualifier, qualifier…", so
+// the food noun is the first comma-segment ("Chicken, broilers…", "Apples,
+// raw"). Finfish/shellfish are "Fish, salmon, …" / "Mollusks, oyster, …", where
+// the noun you'd type is the SECOND segment. Product-y items match neither
+// ("Chicken patty", "Salmon nuggets", "Apple juice").
+//   0 = token is the leading segment   1 = token is the second segment   2 = neither
+function primaryRank(food, t0) {
+  const segs = food._segs || (food._segs = food._lc.split(",").map(s => s.trim()));
+  const eq = s => s === t0 || s === t0 + "s" || s === t0 + "es" || s + "s" === t0 || s + "es" === t0;
+  if (eq(segs[0])) return 0;
+  if (segs.length > 1 && eq(segs[1])) return 1;
+  return 2;
+}
+
+// Return food indices matching all whitespace-separated tokens, ranked so that
+// basic whole foods come first.
+function searchFoods(query) {
+  const q = query.trim().toLowerCase();
+  if (q.length < 2) return [];
+  const tokens = q.split(/\s+/);
+  const t0 = tokens[0];
+  // Each token can match itself or its singular form (so "oysters" finds the
+  // "Mollusks, oyster, …" entries, "eggs" finds "Egg, …", etc.).
+  const variants = tokens.map(t =>
+    t.length > 3 && t.endsWith("s") ? [t, t.slice(0, -1)] : [t]);
+  const hits = [];
+  for (let i = 0; i < FOODS.length; i++) {
+    const f = FOODS[i];
+    const name = f._lc || (f._lc = f.name.toLowerCase());
+    let ok = true;
+    for (const vs of variants) {
+      if (!vs.some(v => name.indexOf(v) >= 0)) { ok = false; break; }
+    }
+    if (ok) hits.push(i);
+  }
+  hits.sort((a, b) => {
+    const fa = FOODS[a], fb = FOODS[b];
+    let d = tierOf(fa) - tierOf(fb); if (d) return d;          // 1. whole-food groups first
+    d = primaryRank(fa, t0) - primaryRank(fb, t0); if (d) return d; // 2. canonical "Noun, …" first
+    d = (fa._lc.startsWith(t0) ? 0 : 1) - (fb._lc.startsWith(t0) ? 0 : 1); if (d) return d; // 3. leading match
+    const ia = fa._lc.indexOf(t0), ib = fb._lc.indexOf(t0);        // 4. exact token earlier in name
+    d = (ia < 0 ? 1e9 : ia) - (ib < 0 ? 1e9 : ib); if (d) return d; //    (-1 = only singular matched → last)
+    const ca = fa._cc ?? (fa._cc = (fa.name.match(/,/g) || []).length);
+    const cb = fb._cc ?? (fb._cc = (fb.name.match(/,/g) || []).length);
+    d = ca - cb; if (d) return d;                             // 5. fewer qualifiers = more basic
+    return fa.name.length - fb.name.length;                   // 6. shorter
+  });
+  return hits;
+}
+
+// --- Persistence: keep entered foods across page refreshes -------------------
+// Stored by food NAME (not array index) so saved meals survive a database
+// regeneration. Wrapped in try/catch in case localStorage is unavailable.
+const STORE_KEY = "nutrientBalancer.v1";
+let restoring = false;
+let draggingRow = null;
+
+// Which row should the dragged row be inserted *before*, given the cursor Y?
+function rowAfterCursor(container, y) {
+  const others = [...container.querySelectorAll(".meal-row:not(.dragging)")];
+  let closest = null, closestDist = -Infinity;
+  for (const r of others) {
+    const box = r.getBoundingClientRect();
+    const offset = y - (box.top + box.height / 2);  // negative = cursor above midpoint
+    if (offset < 0 && offset > closestDist) { closestDist = offset; closest = r; }
+  }
+  return closest;
+}
+
+// Serialize the current on-screen rows + days into a plain object.
+function currentRowsData() {
+  const rows = [...document.querySelectorAll(".meal-row")].map(r => ({
+    food: r.querySelector(".food-search").value,
+    grams: r.querySelector(".grams").value,
+    mult: r.querySelector(".mult").value,
+  }));
+  const daysEl = document.getElementById("days");
+  return { rows, days: daysEl ? daysEl.value : "1" };
+}
+
+// Rebuild the UI from a saved data object, then persist it as the working set.
+function applyState(data) {
+  restoring = true;
+  document.getElementById("mealRows").innerHTML = "";
+  document.getElementById("days").value = (data && data.days) || "1";
+  const rows = (data && data.rows) || [];
+  if (rows.length) rows.forEach(r => addMealRow(r, false));
+  else addMealRow(undefined, false);
+  restoring = false;
+  saveState();
+}
+
+function saveState() {
+  if (restoring) return;
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(currentRowsData())); }
+  catch (e) { /* storage disabled — silently skip */ }
+}
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) { return null; }
+}
+
+// --- Named diet sets: save / load / delete (separate from the working set) ---
+const SAVES_KEY = "nutrientBalancer.saves.v1";
+
+function loadSaves() {
+  try { return JSON.parse(localStorage.getItem(SAVES_KEY)) || {}; }
+  catch (e) { return {}; }
+}
+function writeSaves(map) {
+  try { localStorage.setItem(SAVES_KEY, JSON.stringify(map)); } catch (e) {}
+}
+function refreshSavesUI(selected) {
+  const sel = document.getElementById("savedList");
+  if (!sel) return;
+  const names = Object.keys(loadSaves()).sort((a, b) => a.localeCompare(b));
+  sel.innerHTML = `<option value="">${names.length ? "— pick a saved diet —" : "— no saved diets —"}</option>` +
+    names.map(n => `<option${n === selected ? " selected" : ""}>${escapeHtml(n)}</option>`).join("");
+}
+function saveCurrentDiet() {
+  const input = document.getElementById("dietName");
+  const name = input.value.trim();
+  if (!name) { alert("Type a name for this diet first."); input.focus(); return; }
+  const map = loadSaves();
+  if (name in map && !confirm(`Overwrite the saved diet "${name}"?`)) return;
+  map[name] = currentRowsData();
+  writeSaves(map);
+  refreshSavesUI(name);
+}
+function loadSavedDiet() {
+  const name = document.getElementById("savedList").value;
+  if (!name) return;
+  const map = loadSaves();
+  if (map[name]) {
+    applyState(map[name]);
+    document.getElementById("dietName").value = name;
+    document.getElementById("results").innerHTML = "";   // stale results
+  }
+}
+function deleteSavedDiet() {
+  const name = document.getElementById("savedList").value;
+  if (!name) return;
+  if (!confirm(`Delete the saved diet "${name}"? (Your current entries stay as they are.)`)) return;
+  const map = loadSaves();
+  delete map[name];
+  writeSaves(map);
+  refreshSavesUI();
+}
+
+// Append a fresh meal row with a ranked typeahead food picker.
+// `prefill` = { food, grams, mult } restores a saved row; `focus` auto-focuses it.
+function addMealRow(prefill, focus = true) {
+  const row = document.createElement("div");
+  row.className = "meal-row";
+  row.innerHTML =
+    `<span class="drag-handle" draggable="true" title="drag to reorder">⠿</span>` +
+    `<div class="food-cell">` +
+      `<input class="food-search" placeholder="type to search ${FOODS.length} foods…" autocomplete="off">` +
+      `<div class="food-dropdown" hidden></div>` +
+    `</div>` +
+    `<input class="grams" type="number" min="1" step="1" placeholder="grams" value="100">` +
+    `<input class="mult" type="number" min="1" step="1" value="1" title="multiplier — e.g. 5 if you ate this on 5 days">` +
+    `<button type="button" class="link-btn" title="remove this food" aria-label="remove">✕</button>`;
+  const search = row.querySelector(".food-search");
+  const dd = row.querySelector(".food-dropdown");
+  let current = [], active = -1;
+
+  const close = () => { dd.hidden = true; dd.innerHTML = ""; active = -1; };
+  function renderList() {
+    current = searchFoods(search.value).slice(0, 60);
+    if (search.value.trim().length < 2) { close(); return; }
+    if (!current.length) { dd.innerHTML = `<div class="food-opt none">no matches</div>`; dd.hidden = false; return; }
+    dd.innerHTML = current.map((idx, i) =>
+      `<div class="food-opt" data-i="${i}"><span class="opt-name">${escapeHtml(FOODS[idx].name)}</span>` +
+      `<span class="opt-grp">${escapeHtml(FOODS[idx].group)}</span></div>`).join("");
+    active = -1; dd.hidden = false; dd.scrollTop = 0;
+  }
+  function highlight() {
+    [...dd.children].forEach((c, i) => c.classList.toggle("active", i === active));
+    if (dd.children[active]) dd.children[active].scrollIntoView({ block: "nearest" });
+  }
+  function pick(i) {
+    const idx = current[i];
+    if (idx === undefined) return;
+    search.value = FOODS[idx].name;
+    row.dataset.idx = String(idx);
+    search.classList.remove("invalid");
+    close();
+    saveState();
+  }
+
+  search.addEventListener("input", () => { row.dataset.idx = ""; renderList(); saveState(); });
+  search.addEventListener("focus", () => { if (search.value.trim().length >= 2) renderList(); });
+  search.addEventListener("blur", () => {
+    setTimeout(close, 150); // let a click on an option register first
+    const idx = NAME_TO_INDEX.get(search.value.trim());
+    if (idx !== undefined) row.dataset.idx = String(idx);
+    search.classList.toggle("invalid", search.value.trim() !== "" && idx === undefined);
+    saveState();
+  });
+  search.addEventListener("keydown", e => {
+    if (dd.hidden) return;
+    if (e.key === "ArrowDown") { e.preventDefault(); active = Math.min(active + 1, current.length - 1); highlight(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); active = Math.max(active - 1, 0); highlight(); }
+    else if (e.key === "Enter" && active >= 0) { e.preventDefault(); pick(active); }
+    else if (e.key === "Escape") { close(); }
+  });
+  dd.addEventListener("mousedown", e => {
+    const opt = e.target.closest(".food-opt");
+    if (!opt || opt.classList.contains("none")) return;
+    e.preventDefault(); // keep focus, beat blur
+    pick(Number(opt.dataset.i));
+  });
+
+  row.querySelector(".grams").addEventListener("input", saveState);
+  row.querySelector(".mult").addEventListener("input", saveState);
+
+  row.querySelector(".link-btn").addEventListener("click", () => {
+    row.remove();
+    if (!document.querySelector(".meal-row")) addMealRow(); // keep ≥1 row
+    saveState();
+  });
+
+  // Drag-to-reorder via the handle (rows themselves aren't draggable, so the
+  // inputs stay clickable). Live reordering is handled by the container below.
+  const handle = row.querySelector(".drag-handle");
+  handle.addEventListener("dragstart", e => {
+    draggingRow = row;
+    row.classList.add("dragging");
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", "");   // Firefox needs data set
+  });
+  handle.addEventListener("dragend", () => {
+    row.classList.remove("dragging");
+    draggingRow = null;
+    saveState();                                 // persist new order
+  });
+
+  document.getElementById("mealRows").appendChild(row);
+
+  if (prefill) {
+    search.value = prefill.food || "";
+    row.querySelector(".grams").value = prefill.grams || "";
+    if (prefill.mult != null && prefill.mult !== "") row.querySelector(".mult").value = prefill.mult;
+    const idx = NAME_TO_INDEX.get((prefill.food || "").trim());
+    if (idx !== undefined) row.dataset.idx = String(idx);
+    else if ((prefill.food || "").trim()) search.classList.add("invalid");
+  }
+  if (focus) search.focus();
+  return row;
+}
+
+// Reset the working set to a single empty row. Saved named diets are untouched.
+function clearAll() {
+  try { localStorage.removeItem(STORE_KEY); } catch (e) {}
+  document.getElementById("mealRows").innerHTML = "";
+  document.getElementById("days").value = "1";
+  document.getElementById("results").innerHTML = "";
+  document.getElementById("dietName").value = "";
+  addMealRow();
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  applyState(loadState());        // restore the working set (or one empty row)
+  refreshSavesUI();               // populate the saved-diets dropdown
+
+  document.getElementById("addRow").addEventListener("click", () => addMealRow());
+  document.getElementById("clearAll").addEventListener("click", clearAll);
+  document.getElementById("days").addEventListener("input", saveState);
+  document.getElementById("calculate").addEventListener("click", renderResults);
+  document.getElementById("saveDiet").addEventListener("click", saveCurrentDiet);
+  document.getElementById("loadDiet").addEventListener("click", loadSavedDiet);
+  document.getElementById("deleteDiet").addEventListener("click", deleteSavedDiet);
+
+  // Live reorder: as the dragged row moves, slot it among the others by cursor Y.
+  const mealRows = document.getElementById("mealRows");
+  mealRows.addEventListener("dragover", e => {
+    if (!draggingRow) return;
+    e.preventDefault();
+    const before = rowAfterCursor(mealRows, e.clientY);
+    if (before == null) mealRows.appendChild(draggingRow);
+    else if (before !== draggingRow.nextSibling) mealRows.insertBefore(draggingRow, before);
+  });
+  mealRows.addEventListener("drop", e => e.preventDefault());
+});

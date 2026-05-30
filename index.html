@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nutrient Balancer</title>
+<style>
+  :root { --bg:#f7f8fa; --card:#fff; --line:#e3e6ea; --ink:#1f2933; --muted:#6b7280; --accent:#2563eb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+         background:var(--bg); color:var(--ink); line-height:1.45; }
+  header { background:#1f2933; color:#fff; padding:20px 24px; }
+  header h1 { margin:0; font-size:1.4rem; }
+  header p { margin:4px 0 0; color:#cbd5e1; font-size:.9rem; }
+  main { max-width:840px; margin:0 auto; padding:24px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:18px 20px; margin-bottom:18px; }
+  h2 { margin:8px 0 12px; } h3 { margin:0 0 12px; font-size:1.05rem; }
+  label { display:block; font-size:.85rem; font-weight:600; margin-bottom:4px; }
+  select, input { font:inherit; padding:8px 10px; border:1px solid var(--line);
+                  border-radius:6px; background:#fff; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; }
+  .row > div { flex:1; min-width:140px; }
+  #days { width:100%; }
+  button { font:inherit; font-weight:600; cursor:pointer; border:none; border-radius:6px;
+           padding:9px 16px; background:var(--accent); color:#fff; }
+  button:hover { background:#1d4ed8; }
+  .secondary-btn { background:#eef2ff; color:var(--accent); }
+  .secondary-btn:hover { background:#e0e7ff; }
+  /* handle | food | serving | × | remove — food (1fr) takes all remaining width */
+  .rows-head, .meal-row { display:grid; grid-template-columns:18px 1fr 64px 44px auto; gap:8px; align-items:center; }
+  .rows-head { font-size:.78rem; font-weight:600; color:var(--muted);
+               text-transform:uppercase; letter-spacing:.03em; margin-bottom:6px; }
+  .rows-head .mult-head { white-space:nowrap; text-transform:none; font-size:.72rem; letter-spacing:0; }
+  .meal-row { margin-bottom:10px; }
+  .meal-row .food-cell { position:relative; min-width:0; }
+  .food-cell .food-search, .meal-row .grams, .meal-row .mult { width:100%; }
+  .meal-row .mult { text-align:center; padding-left:6px; padding-right:4px; }
+  .meal-row .link-btn { font-size:1rem; line-height:1; justify-self:start; }
+  .drag-handle { cursor:grab; color:#b3b9c2; user-select:none; font-size:1rem;
+                 line-height:1; text-align:center; }
+  .drag-handle:active { cursor:grabbing; }
+  .meal-row.dragging { opacity:.45; }
+  .meal-row.drag-over { box-shadow:inset 0 2px 0 0 var(--accent); }
+  .saves-bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+               margin-top:14px; padding-top:14px; border-top:1px solid var(--line); }
+  .saves-title { font-size:.82rem; color:var(--muted); margin-right:2px; }
+  .saves-bar #dietName { flex:1 1 150px; min-width:120px; }
+  .saves-bar #savedList { flex:1 1 150px; min-width:120px; }
+  .saves-spacer { flex:1 1 0; }
+  /* drop number spinners so the narrow numeric fields aren't crowded */
+  .meal-row input[type=number]::-webkit-inner-spin-button,
+  .meal-row input[type=number]::-webkit-outer-spin-button { -webkit-appearance:none; margin:0; }
+  .meal-row input[type=number] { -moz-appearance:textfield; appearance:textfield; }
+  .food-search.invalid { border-color:#dc2626; background:#fef2f2; }
+  .food-dropdown { position:absolute; z-index:30; left:0; right:0; top:calc(100% + 2px);
+    background:#fff; border:1px solid var(--line); border-radius:6px; max-height:300px;
+    overflow-y:auto; box-shadow:0 8px 22px rgba(0,0,0,.14); }
+  .food-opt { display:flex; justify-content:space-between; gap:10px; align-items:baseline;
+    padding:7px 10px; font-size:.88rem; cursor:pointer; border-bottom:1px solid #f1f3f5; }
+  .food-opt:last-child { border-bottom:none; }
+  .food-opt:hover, .food-opt.active { background:#eef2ff; }
+  .food-opt .opt-grp { color:var(--muted); font-size:.72rem; white-space:nowrap; }
+  .food-opt.none { color:var(--muted); cursor:default; justify-content:flex-start; }
+  .link-btn { background:none; color:#dc2626; padding:0; font-weight:500; font-size:.85rem; }
+  .link-btn:hover { background:none; text-decoration:underline; }
+  .muted { color:var(--muted); font-size:.9rem; }
+  .ok { color:#15803d; font-weight:600; }
+  #calculate { width:100%; padding:12px; font-size:1rem; margin-top:4px; }
+  .chart-flex { display:flex; gap:24px; align-items:center; flex-wrap:wrap; }
+  .legend-title { font-weight:600; margin-bottom:6px; }
+  .legend-row { font-size:.9rem; margin:3px 0; }
+  .swatch { display:inline-block; width:12px; height:12px; border-radius:2px; margin-right:6px; vertical-align:middle; }
+  .bar-label { font-size:11px; fill:var(--ink); }
+  .bar-pct { font-size:11px; fill:var(--muted); }
+  .bar-pct.met { fill:#2f8f3e; font-weight:600; }
+  .food-legend { display:flex; flex-wrap:wrap; gap:6px 16px; align-items:center; }
+  .food-legend .legend-title { width:100%; margin-bottom:2px; }
+  .food-chip { font-size:.85rem; white-space:nowrap; }
+  h4.sub { margin:16px 0 6px; font-size:.9rem; color:var(--muted); font-weight:600; }
+  .swap-controls { display:flex; flex-direction:column; gap:8px; margin-bottom:6px; }
+  .swap-ctl { display:flex; align-items:center; gap:8px; }
+  .swap-ctl .swatch { flex:0 0 auto; }
+  .swap-ctl .swap-select { flex:1; min-width:0; }
+  .swap-preview { border-top:1px solid var(--line); margin-top:10px; padding-top:4px; }
+  svg rect[fill]:not([fill="#eef0f3"]):hover { opacity:.82; }
+  ol.swaps li { margin-bottom:10px; }
+  details { margin-top:10px; } summary { cursor:pointer; font-weight:600; }
+  footer { text-align:center; color:var(--muted); font-size:.8rem; padding:0 24px 32px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🥗 Nutrient Balancer</h1>
+  <p>Log meals → see macros & micros vs. Daily Values → get food-swap suggestions to fill the gaps.</p>
+</header>
+
+<main>
+  <div class="card">
+    <h3>1. Add your meals</h3>
+    <p class="muted" style="margin-top:0">Start typing a food name — the list filters as you type. Pick a match from the suggestions.</p>
+    <div class="rows-head">
+      <span></span>
+      <span>Food (type to search)</span>
+      <span>Serving (g)</span>
+      <span class="mult-head" title="multiplier — e.g. 5 if eaten on 5 days">× multiplier</span>
+    </div>
+    <div id="mealRows"></div>
+    <div style="margin-top:12px; display:flex; gap:10px; align-items:center;">
+      <button id="addRow" class="secondary-btn">+ Add another food</button>
+      <button id="clearAll" class="link-btn">Clear all</button>
+    </div>
+    <div class="saves-bar">
+      <strong class="saves-title">Saved diets</strong>
+      <input id="dietName" placeholder="name this diet…" autocomplete="off">
+      <button id="saveDiet" class="secondary-btn">Save current</button>
+      <span class="saves-spacer"></span>
+      <select id="savedList"></select>
+      <button id="loadDiet" class="secondary-btn">Load</button>
+      <button id="deleteDiet" class="link-btn">Delete</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>2. How many days do these meals cover?</h3>
+    <div class="row">
+      <div style="flex:0 0 160px">
+        <label for="days">Days</label>
+        <input id="days" type="number" min="1" step="1" value="1">
+      </div>
+    </div>
+    <p class="muted">Totals are divided by this to get your average daily intake.</p>
+  </div>
+
+  <button id="calculate">Calculate & balance</button>
+
+  <div id="results" style="margin-top:24px"></div>
+</main>
+
+<footer>
+  Nutrient data: USDA FoodData Central SR Legacy (7,793 foods, per 100 g). Daily Values: FDA
+  Nutrition Facts label (adults &amp; children 4+). Educational planning aid — not medical advice.
+</footer>
+
+<script src="foods.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
