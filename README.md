@@ -22,7 +22,7 @@ the others.
 
 ## What it does
 
-1. **Log meals** — start typing a food name; a ranked dropdown filters the 7,793 foods as you type. Results are ordered **whole/basic foods first** (e.g. typing "chicken" surfaces the generic cuts — breast/thigh, with/without skin, raw/roasted/fried — before restaurant or branded items). Singular/plural both work ("oysters" finds "Mollusks, oyster…"). Pick a match (click or arrow-keys + Enter) and enter a serving in grams. Each row also has a **× multiplier** (e.g. enter 200 g ×5 if you ate that serving on 5 days) so you can log multiple days quickly. Add as many rows as you like, and **drag the ⠿ handle to reorder** them.
+1. **Log meals** — start typing a food name; a ranked dropdown filters the 7,793 foods as you type. Results are ordered **whole/basic foods first** (e.g. typing "chicken" surfaces the generic cuts — breast/thigh, with/without skin, raw/roasted/fried — before restaurant or branded items). Singular/plural both work ("oysters" finds "Mollusks, oyster…"). Foods already in your meal list float to the **top of every search** (tagged "in your list"), so they're easy to reuse in the swap explorer and compare tool. Pick a match (click or arrow-keys + Enter) and enter a serving in grams. Each row also has a **× multiplier** (e.g. enter 200 g ×5 if you ate that serving on 5 days) so you can log multiple days quickly. Add as many rows as you like, and **drag the ⠿ handle to reorder** them.
 2. **Enter days covered** — totals are divided by this to get your *average daily intake*.
 3. **Calculate** — you get:
    - a **pie chart** of macronutrients (protein / carbs / fat by calorie share, plus fiber),
@@ -41,11 +41,20 @@ the others.
      fat and cholesterol are shown against their upper limits,
    - a **Carotenoids** breakdown — beta-carotene, lutein+zeaxanthin, lycopene
      (informational amounts; no DV exists for these),
-   - a **"What If I Swapped…" explorer** — a dropdown per logged food listing its
+   - an **Essential amino acids** chart (same %-of-target, stacked-by-food style
+     as the micros) — the 9 indispensable amino acids vs. IOM requirements for a
+     ~70 kg adult (Met+Cys and Phe+Tyr grouped as in protein-quality scoring),
+   - a **"What If I Swapped…" explorer** — per logged food, a dropdown of its
      top 10 calorie-matched replacements (deduped by nutrient profile for variety,
-     so you don't get ten kinds of liver). Pick replacements for one or more foods
-     and the balance preview (and "micros at 100% DV: X → Y") updates live.
+     so you don't get ten kinds of liver) **plus a search box to try any food** in
+     the database. Each suggestion is labeled with the deficient-nutrient gaps it
+     closes. Pick replacements for one or more foods and the balance preview (and
+     "micros at 100% DV: X → Y") updates live.
    - automatic **swap recommendations** to close any gaps.
+
+There's also a standalone **Compare two ingredients** card (independent of your
+logged diet): pick two foods and serving sizes to see every nutrient side by
+side, with %DV and the higher value highlighted.
 
 ## How the recommendations work
 

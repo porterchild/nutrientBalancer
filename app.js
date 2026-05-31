@@ -5,7 +5,7 @@
 
 "use strict";
 
-const ALL_KEYS = [...MACRO_KEYS, ...MICRO_KEYS, ...FAT_KEYS, ...CAROT_KEYS, ...LIMIT_KEYS];
+const ALL_KEYS = [...MACRO_KEYS, ...MICRO_KEYS, ...FAT_KEYS, ...CAROT_KEYS, ...AMINO_KEYS, ...LIMIT_KEYS];
 
 // ---------------------------------------------------------------------------
 // Nutrient math
@@ -171,6 +171,24 @@ function deficientMicros(daily) {
   return MICRO_KEYS.filter(k => dvFraction(daily, k) < DEFICIT_EPS);
 }
 
+// Describe a before→after change in terms of the gaps it actually closes: only
+// nutrients that were BELOW DV, and only the portion of the shortfall filled
+// (capped at 100% so overshoot doesn't inflate the number). This matches what
+// the ranking rewards, so the label explains why a swap was suggested.
+function gapClosedGains(beforeDaily, afterDaily, limit = 2) {
+  return MICRO_KEYS
+    .map(k => {
+      const base = dvFraction(beforeDaily, k);
+      if (base >= DEFICIT_EPS) return null;                 // wasn't deficient
+      const closed = Math.min(dvFraction(afterDaily, k), 1) - base;
+      return closed > 0.01 ? { k, closed } : null;          // ignore trivial (<1%)
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.closed - a.closed)
+    .slice(0, limit)
+    .map(g => `${DAILY_VALUES[g.k].label} +${Math.round(g.closed * 100)}%`);
+}
+
 // Produce a sequence of recommended swaps. Returns { swaps, finalMeals }.
 function optimize(baseMeals, days) {
   let working = baseMeals.map(m => ({ ...m }));
@@ -278,15 +296,10 @@ function topReplacements(meals, pos, days, n = 10) {
     top.push(cand);
   }
 
-  // Annotate each with its single biggest micronutrient gain.
+  // Annotate each with the deficient-nutrient gaps it closes most (why it ranks).
   for (const cand of top) {
     const trialDaily = perDay(addScaled(without, cand.addIdx, cand.grams, +1), days);
-    let bestK = null, bestD = 0;
-    for (const k of MICRO_KEYS) {
-      const d = dvFraction(trialDaily, k) - dvFraction(baseDaily, k);
-      if (d > bestD) { bestD = d; bestK = k; }
-    }
-    cand.gainText = bestK ? `+${Math.round(bestD * 100)}% ${DAILY_VALUES[bestK].label}` : "";
+    cand.gainText = gapClosedGains(baseDaily, trialDaily, 2).join(", ");
   }
   return top;
 }
@@ -422,15 +435,16 @@ function macroPie(daily) {
     </div>`;
 }
 
-// Each bar is scaled so 100% DV sits at a fixed reference line; the filled
-// portion is split into per-food segments (colored consistently with the
-// legend). Bar caps at 150% DV for layout.
-function microBars(daily, mealList, perFood) {
+// Bars scaled so 100% of target sits at a fixed reference line; the filled
+// portion is split into per-food segments (colored to match the legend). Bar
+// caps at 150% for layout. `keys` selects which nutrients; `lineLabel` names the
+// reference line (e.g. "100% DV" or "100% target").
+function dvBars(keys, daily, mealList, perFood, lineLabel = "100% DV") {
   const rowH = 26, labelW = 130, barW = 320, padTop = 8, scale = barW / 1.5;
-  const h = padTop + MICRO_KEYS.length * rowH + 24;
+  const h = padTop + keys.length * rowH + 24;
   const fullW = labelW + barW + 70;
   let rows = "";
-  MICRO_KEYS.forEach((k, i) => {
+  keys.forEach((k, i) => {
     const frac = dvFraction(daily, k);
     const y = padTop + i * rowH;
     const total = daily[k] || 0;
@@ -453,9 +467,9 @@ function microBars(daily, mealList, perFood) {
     rows += `<text x="${labelW + barW / 1.5 + 8}" y="${y + 16}" class="${pctClass}">${Math.round(frac * 100)}%</text>`;
   });
   const lineX = labelW + scale;
-  rows += `<line x1="${lineX}" y1="${padTop}" x2="${lineX}" y2="${padTop + MICRO_KEYS.length * rowH}"
+  rows += `<line x1="${lineX}" y1="${padTop}" x2="${lineX}" y2="${padTop + keys.length * rowH}"
             stroke="#333" stroke-width="1.5" stroke-dasharray="4 3"/>
-           <text x="${lineX}" y="${padTop + MICRO_KEYS.length * rowH + 16}" text-anchor="middle" class="bar-pct">100% DV</text>`;
+           <text x="${lineX}" y="${padTop + keys.length * rowH + 16}" text-anchor="middle" class="bar-pct">${lineLabel}</text>`;
   return `<svg viewBox="0 0 ${fullW} ${h}" width="100%" preserveAspectRatio="xMinYMin meet" role="img">${rows}</svg>`;
 }
 
@@ -509,7 +523,9 @@ function renderResults() {
     <div class="card">${foodLegend(meals)}<p class="muted" style="margin:0 0 4px">Hover any segment for the exact amount.</p></div>
     <div class="card"><h3>Macronutrients</h3>${macroPie(daily)}
       <h4 class="sub">Where each macro comes from</h4>${macroBars(meals, perFood, daily)}</div>
-    <div class="card"><h3>Micronutrients vs. Daily Value</h3>${microBars(daily, meals, perFood)}</div>
+    <div class="card"><h3>Micronutrients vs. Daily Value</h3>${dvBars(MICRO_KEYS, daily, meals, perFood)}</div>
+    <div class="card"><h3>Essential amino acids vs. requirement</h3>${dvBars(AMINO_KEYS, daily, meals, perFood, "100% req")}
+      <p class="muted" style="margin:8px 0 0">Targets are IOM estimated requirements for a ~70 kg adult (they scale with body weight); no FDA Daily Value exists for amino acids. Met+Cys and Phe+Tyr are grouped as in protein-quality scoring.</p></div>
     <div class="card"><h3>Fats &amp; fatty acids</h3>${stackedNutrientBars(FAT_KEYS, meals, perFood, daily)}
       <p class="muted" style="margin:8px 0 0">Omega-3/6 use IOM Adequate Intakes (no FDA Daily Value exists); saturated fat &amp; cholesterol are upper limits.</p></div>
     <div class="card"><h3>Carotenoids (phytonutrients)</h3>${stackedNutrientBars(CAROT_KEYS, meals, perFood, daily)}
@@ -529,11 +545,7 @@ function renderResults() {
     } else {
       html += `<p>Suggested calorie-matched swaps (applied in order, recomputing totals each time):</p><ol class="swaps">`;
       for (const s of swaps) {
-        const gains = MICRO_KEYS
-          .map(k => ({ k, d: dvFraction(s.after, k) - dvFraction(s.before, k) }))
-          .filter(x => x.d > 0.03)
-          .sort((a, b) => b.d - a.d).slice(0, 4)
-          .map(x => `${DAILY_VALUES[x.k].label} +${Math.round(x.d * 100)}%`).join(", ");
+        const gains = gapClosedGains(s.before, s.after, 4).join(", ");
         html += `<li>Swap <strong>${s.removeGrams} g ${s.removeFood}</strong> →
                  <strong>${s.addGrams} g ${s.addFood}</strong>
                  ${gains ? `<br><span class="muted">gains: ${gains}</span>` : ""}</li>`;
@@ -545,7 +557,7 @@ function renderResults() {
       html += `<p class="muted">After these swaps: ${MICRO_KEYS.length - stillLow.length}/${MICRO_KEYS.length} micros at 100%+ DV` +
         (stillLow.length ? `; still low: ${stillLow.map(k => DAILY_VALUES[k].label).join(", ")}.` : `. All targets met!`) + `</p>`;
       html += `<details><summary>Projected micronutrient chart after swaps</summary>` +
-        `${foodLegend(finalMeals, "Foods after swaps")}${microBars(finalDaily, finalMeals, finalPerFood)}</details>`;
+        `${foodLegend(finalMeals, "Foods after swaps")}${dvBars(MICRO_KEYS, finalDaily, finalMeals, finalPerFood)}</details>`;
     }
   }
   html += `</div>`;
@@ -563,14 +575,22 @@ function mountSwapExplorer(meals, days) {
   const baseDaily = perDay(totals(meals), days);
   const baseMet = MICRO_KEYS.length - deficientMicros(baseDaily).length;
   const selection = {};                       // pos -> { addIdx, grams } or absent
+  const customByPos = {};                     // pos -> last food picked via search
   const replacementsByPos = meals.map((_, pos) => topReplacements(meals, pos, days, 10));
 
   box.innerHTML = `<h3>What If I Swapped…</h3>
-    <p class="muted">Pick a replacement for any food to preview the new balance. Combine as many as you like — calorie-matched servings.</p>
+    <p class="muted">Pick from the top-10 suggestions <em>or</em> search any food to try it. Combine as many as you like — calorie-matched servings.</p>
     <div class="swap-controls"></div>
     <div class="swap-preview"></div>`;
   const controls = box.querySelector(".swap-controls");
   const preview = box.querySelector(".swap-preview");
+
+  // Calorie-matched serving for replacing the logged food at `pos`.
+  const matchGrams = (pos, addIdx) => {
+    const removedKcal = (FOODS[meals[pos].foodIndex].kcal * meals[pos].grams) / 100;
+    const g = removedKcal > 0 ? (removedKcal / FOODS[addIdx].kcal) * 100 : 100;
+    return Math.max(20, Math.min(MAX_SERVING_G, g));
+  };
 
   meals.forEach((m, pos) => {
     const ctl = document.createElement("div");
@@ -582,11 +602,29 @@ function mountSwapExplorer(meals, days) {
     ctl.innerHTML =
       `<span class="swatch" style="background:${colorFor(pos)}"></span>` +
       `<select class="swap-select" data-pos="${pos}">${opts.join("")}</select>`;
+    const sel = ctl.querySelector("select");
+
+    // Search box: try ANY food. A pick adds/updates a "✎ custom" option on the
+    // select and selects it, so the dropdown reflects the active choice and you
+    // can still revert to "Keep" or a top-10 option.
+    const searcher = buildFoodSearch(addIdx => {
+      const grams = matchGrams(pos, addIdx);
+      customByPos[pos] = { addIdx, grams };
+      let opt = [...sel.options].find(o => o.value === "c");
+      if (!opt) { opt = document.createElement("option"); opt.value = "c"; sel.appendChild(opt); }
+      opt.textContent = `✎ ${FOODS[addIdx].name} (${Math.round(grams)} g)`;
+      sel.value = "c";
+      selection[pos] = customByPos[pos];
+      updatePreview();
+    });
+    ctl.appendChild(searcher.wrap);
     controls.appendChild(ctl);
-    ctl.querySelector("select").addEventListener("change", e => {
-      const i = e.target.value;
-      if (i === "") delete selection[pos];
-      else selection[pos] = replacementsByPos[pos][Number(i)];
+
+    sel.addEventListener("change", e => {
+      const v = e.target.value;
+      if (v === "") delete selection[pos];
+      else if (v === "c") selection[pos] = customByPos[pos];
+      else selection[pos] = replacementsByPos[pos][Number(v)];
       updatePreview();
     });
   });
@@ -605,19 +643,133 @@ function mountSwapExplorer(meals, days) {
       `<p class="muted" style="margin:14px 0 6px">${nSwaps ? `Previewing ${nSwaps} swap${nSwaps > 1 ? "s" : ""}` : "No swaps selected (showing your current balance)"} — ` +
       `${Math.round(newDaily.kcal)} kcal/day · Sodium ${naPct}% · micros at 100% DV: ${metDelta}</p>` +
       foodLegend(newMeals, "Foods in this scenario") +
-      microBars(newDaily, newMeals, perFood);
+      dvBars(MICRO_KEYS, newDaily, newMeals, perFood);
   }
   updatePreview();
+}
+
+// "Compare two ingredients" — pick two foods (with serving sizes) and see their
+// nutrients side by side, independent of the logged diet.
+const COMPARE_GROUPS = [
+  ["Energy", ["kcal"]],
+  ["Macronutrients", MACRO_KEYS],
+  ["Micronutrients", MICRO_KEYS],
+  ["Fats & fatty acids", FAT_KEYS],
+  ["Carotenoids", CAROT_KEYS],
+  ["Essential amino acids", AMINO_KEYS],
+];
+
+// Significance reference per nutrient (a "meaningful daily amount") used only to
+// suppress highlighting of trivial gaps — e.g. 0 vs 1 mcg shouldn't look huge.
+// For nutrients with a DV/AI we use that; these cover the no-DV ones.
+const SIG_REF = { kcal: 200, bcar: 5000, lutzea: 6000, lyco: 8000, mufa: 5, pufa: 5 };
+
+function compareTable(ia, ga, ib, gb) {
+  const A = contribution(ia, ga), B = contribution(ib, gb);
+  const head = (idx, g, c) =>
+    `<div class="cmp-name">${escapeHtml(FOODS[idx].name)}</div>` +
+    `<div class="muted">${Math.round(g)} g · ${Math.round(c.kcal)} kcal</div>`;
+  let rows = "";
+  for (const [group, keys] of COMPARE_GROUPS) {
+    rows += `<tr class="cmp-group"><td colspan="3">${group}</td></tr>`;
+    for (const k of keys) {
+      const meta = k === "kcal"
+        ? { label: "Calories", unit: "kcal", dv: null }
+        : DAILY_VALUES[k];
+      const va = A[k] || 0, vb = B[k] || 0;
+      if (va === 0 && vb === 0) continue;                 // skip all-zero rows
+      const dvOf = v => meta.dv ? ` <span class="cmp-dv">${Math.round(v / meta.dv * 100)}%</span>` : "";
+      // Escalate the higher cell only when BOTH matter: the relative gap (ratio)
+      // AND the absolute gap as a fraction of a meaningful daily amount (DV/AI/
+      // floor). So a tiny value next to zero (e.g. 2.7 mcg = 2% DV vs 0) stays
+      // plain even though the ratio is huge.
+      //   green  ≥10% ratio & ≥5% DV gap
+      //   bold   ≥50% ratio & ≥10% DV gap
+      //   larger ≥100% ratio & ≥20% DV gap
+      const ref = meta.dv || SIG_REF[k] || 0;
+      const tier = (win, other) => {
+        const d = other > 0 ? (win / other - 1) * 100 : Infinity;
+        const gapFrac = ref ? (win - other) / ref : Infinity;
+        let cls = "";
+        if (d >= 10 && gapFrac >= 0.05) cls = " cmp-hi";
+        if (d >= 50 && gapFrac >= 0.10) cls += " cmp-bold";
+        if (d >= 100 && gapFrac >= 0.20) cls += " cmp-xl";
+        return cls;
+      };
+      const a = va > vb ? tier(va, vb) : "";
+      const b = vb > va ? tier(vb, va) : "";
+      rows += `<tr><td class="cmp-lbl">${meta.label}</td>` +
+        `<td class="cmp-val${a}">${fmt(va)} ${meta.unit}${dvOf(va)}</td>` +
+        `<td class="cmp-val${b}">${fmt(vb)} ${meta.unit}${dvOf(vb)}</td></tr>`;
+    }
+  }
+  return `<table class="cmp-table">
+    <thead><tr><th></th><th>${head(ia, ga, A)}</th><th>${head(ib, gb, B)}</th></tr></thead>
+    <tbody>${rows}</tbody></table>
+    <p class="muted" style="margin:8px 0 0">The higher value is highlighted by how big the gap is — green, then bold, then larger — but only when the amount is also nutritionally meaningful, so a tiny value next to zero stays plain. %DV shown where a Daily Value / AI exists.</p>`;
+}
+
+function mountCompare() {
+  const box = document.getElementById("compare");
+  if (!box) return;
+  let idxA = null, idxB = null;
+  box.innerHTML = `<h3>Compare two ingredients</h3>
+    <p class="muted">Pick two foods to see their nutrients side by side — independent of your logged diet.</p>
+    <div class="compare-inputs">
+      <div class="compare-side"><div class="cmp-search-a"></div>
+        <label class="cmp-g">grams <input class="cmp-grams cmp-grams-a" type="number" min="1" step="1" value="100"></label></div>
+      <div class="compare-side"><div class="cmp-search-b"></div>
+        <label class="cmp-g">grams <input class="cmp-grams cmp-grams-b" type="number" min="1" step="1" value="100"></label></div>
+    </div>
+    <div class="compare-result"></div>`;
+  const sa = buildFoodSearch(i => { idxA = i; render(); }, { keepValue: true, placeholder: "search first food…" });
+  const sb = buildFoodSearch(i => { idxB = i; render(); }, { keepValue: true, placeholder: "search second food…" });
+  box.querySelector(".cmp-search-a").appendChild(sa.wrap);
+  box.querySelector(".cmp-search-b").appendChild(sb.wrap);
+  const gA = box.querySelector(".cmp-grams-a"), gB = box.querySelector(".cmp-grams-b");
+  gA.addEventListener("input", render);
+  gB.addEventListener("input", render);
+
+  function render() {
+    const out = box.querySelector(".compare-result");
+    if (idxA == null || idxB == null) {
+      out.innerHTML = `<p class="muted">Pick a food on each side to compare.</p>`;
+      return;
+    }
+    const ga = Math.max(0, Number(gA.value) || 0), gb = Math.max(0, Number(gB.value) || 0);
+    out.innerHTML = compareTable(idxA, ga, idxB, gb);
+  }
+  render();
 }
 
 // ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
 
-// Grouped <option> markup for the food <select>, built once.
 // Map of exact food name -> index, for resolving typed/picked values.
 const NAME_TO_INDEX = new Map();
 FOODS.forEach((f, i) => { if (!NAME_TO_INDEX.has(f.name)) NAME_TO_INDEX.set(f.name, i); });
+
+// Food indices currently present in the meal rows (resolved by data-idx or name).
+// Used to float already-logged foods to the top of search results.
+function enteredFoodIndices() {
+  const set = new Set();
+  document.querySelectorAll(".meal-row").forEach(r => {
+    const di = Number(r.dataset.idx);
+    if (Number.isInteger(di) && di >= 0 && FOODS[di]) { set.add(di); return; }
+    const sEl = r.querySelector(".food-search");
+    if (sEl) { const idx = NAME_TO_INDEX.get(sEl.value.trim()); if (idx !== undefined) set.add(idx); }
+  });
+  return set;
+}
+
+// One dropdown option row; tags foods already in the user's meal list.
+function foodOptionHTML(idx, i, entered) {
+  const tag = entered && entered.has(idx) ? `<span class="opt-in">in your list</span>` : "";
+  return `<div class="food-opt" data-i="${i}">` +
+    `<span class="opt-name">${escapeHtml(FOODS[idx].name)}${tag}</span>` +
+    `<span class="opt-grp">${escapeHtml(FOODS[idx].group)}</span></div>`;
+}
 
 // --- Search ranking: surface whole/basic foods before niche/branded ones ----
 // Lower tier = more "basic whole food" → shown first.
@@ -676,9 +828,11 @@ function searchFoods(query) {
     }
     if (ok) hits.push(i);
   }
+  const entered = enteredFoodIndices();
   hits.sort((a, b) => {
     const fa = FOODS[a], fb = FOODS[b];
-    let d = tierOf(fa) - tierOf(fb); if (d) return d;          // 1. whole-food groups first
+    let d = (entered.has(a) ? 0 : 1) - (entered.has(b) ? 0 : 1); if (d) return d; // 0. foods you've already logged
+    d = tierOf(fa) - tierOf(fb); if (d) return d;             // 1. whole-food groups first
     d = primaryRank(fa, t0) - primaryRank(fb, t0); if (d) return d; // 2. canonical "Noun, …" first
     d = (fa._lc.startsWith(t0) ? 0 : 1) - (fb._lc.startsWith(t0) ? 0 : 1); if (d) return d; // 3. leading match
     const ia = fa._lc.indexOf(t0), ib = fb._lc.indexOf(t0);        // 4. exact token earlier in name
@@ -689,6 +843,57 @@ function searchFoods(query) {
     return fa.name.length - fb.name.length;                   // 6. shorter
   });
   return hits;
+}
+
+// Reusable ranked food typeahead. Returns { wrap, search }; calls onPick(idx)
+// with the chosen food index. By default clears itself on pick (swap explorer);
+// pass { keepValue:true } to leave the chosen name in the box (compare tool).
+function buildFoodSearch(onPick, opts = {}) {
+  const wrap = document.createElement("div");
+  wrap.className = "swap-search food-cell";
+  wrap.innerHTML =
+    `<input class="food-search" placeholder="${opts.placeholder || "or search any food…"}" autocomplete="off">` +
+    `<div class="food-dropdown" hidden></div>`;
+  const search = wrap.querySelector(".food-search");
+  const dd = wrap.querySelector(".food-dropdown");
+  let current = [], active = -1;
+  const close = () => { dd.hidden = true; dd.innerHTML = ""; active = -1; };
+  function renderList() {
+    current = searchFoods(search.value).slice(0, 60);
+    if (search.value.trim().length < 2) { close(); return; }
+    if (!current.length) { dd.innerHTML = `<div class="food-opt none">no matches</div>`; dd.hidden = false; return; }
+    const entered = enteredFoodIndices();
+    dd.innerHTML = current.map((idx, i) => foodOptionHTML(idx, i, entered)).join("");
+    active = -1; dd.hidden = false; dd.scrollTop = 0;
+  }
+  function highlight() {
+    [...dd.children].forEach((c, i) => c.classList.toggle("active", i === active));
+    if (dd.children[active]) dd.children[active].scrollIntoView({ block: "nearest" });
+  }
+  function pick(i) {
+    const idx = current[i];
+    if (idx === undefined) return;
+    close();
+    search.value = opts.keepValue ? FOODS[idx].name : "";
+    onPick(idx);
+  }
+  search.addEventListener("input", renderList);
+  search.addEventListener("focus", () => { if (search.value.trim().length >= 2) renderList(); });
+  search.addEventListener("blur", () => setTimeout(close, 150));
+  search.addEventListener("keydown", e => {
+    if (dd.hidden) return;
+    if (e.key === "ArrowDown") { e.preventDefault(); active = Math.min(active + 1, current.length - 1); highlight(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); active = Math.max(active - 1, 0); highlight(); }
+    else if (e.key === "Enter" && active >= 0) { e.preventDefault(); pick(active); }
+    else if (e.key === "Escape") close();
+  });
+  dd.addEventListener("mousedown", e => {
+    const opt = e.target.closest(".food-opt");
+    if (!opt || opt.classList.contains("none")) return;
+    e.preventDefault();
+    pick(Number(opt.dataset.i));
+  });
+  return { wrap, search };
 }
 
 // --- Persistence: keep entered foods across page refreshes -------------------
@@ -816,9 +1021,8 @@ function addMealRow(prefill, focus = true) {
     current = searchFoods(search.value).slice(0, 60);
     if (search.value.trim().length < 2) { close(); return; }
     if (!current.length) { dd.innerHTML = `<div class="food-opt none">no matches</div>`; dd.hidden = false; return; }
-    dd.innerHTML = current.map((idx, i) =>
-      `<div class="food-opt" data-i="${i}"><span class="opt-name">${escapeHtml(FOODS[idx].name)}</span>` +
-      `<span class="opt-grp">${escapeHtml(FOODS[idx].group)}</span></div>`).join("");
+    const entered = enteredFoodIndices();
+    dd.innerHTML = current.map((idx, i) => foodOptionHTML(idx, i, entered)).join("");
     active = -1; dd.hidden = false; dd.scrollTop = 0;
   }
   function highlight() {
@@ -909,6 +1113,7 @@ function clearAll() {
 document.addEventListener("DOMContentLoaded", () => {
   applyState(loadState());        // restore the working set (or one empty row)
   refreshSavesUI();               // populate the saved-diets dropdown
+  mountCompare();                 // standalone ingredient comparison tool
 
   document.getElementById("addRow").addEventListener("click", () => addMealRow());
   document.getElementById("clearAll").addEventListener("click", clearAll);

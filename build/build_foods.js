@@ -21,13 +21,22 @@ const NUT_ID = {
   cu:1098, mn:1101, se:1103, na:1093,
   choline:1180, b5:1170, chol:1253, satfat:1258, mufa:1292, pufa:1293, o6:1269,
   bcar:1107, lutzea:1123, lyco:1122,
+  // essential amino acids (grams)
+  his:1221, ile:1212, leu:1213, lys:1214, thr:1211, trp:1210, val:1219,
 };
 const ID_NUT = {}; for (const k in NUT_ID) ID_NUT[NUT_ID[k]] = k;
-// Omega-3 = ALA(18:3) + EPA(20:5 n-3) + DHA(22:6 n-3) + DPA(22:5 n-3), summed.
-const O3_IDS = new Set(["1270", "1278", "1272", "1280"]);
+// Summed nutrients: source id -> target key.
+//   o3  = ALA(18:3) + EPA(20:5 n-3) + DHA(22:6 n-3) + DPA(22:5 n-3)
+//   saa = Methionine + Cystine  (sulphur amino acids)
+//   aaa = Phenylalanine + Tyrosine  (aromatic amino acids)
+const SUM_MAP = {};
+["1270", "1278", "1272", "1280"].forEach(id => SUM_MAP[id] = "o3");
+["1215", "1216"].forEach(id => SUM_MAP[id] = "saa");
+["1217", "1218"].forEach(id => SUM_MAP[id] = "aaa");
 const NUT_ORDER = ["kcal","p","c","f","fib","vita","vitc","vitd","vite","vitk",
   "b1","b2","b3","b6","fol","b12","ca","fe","mg","ph","k","zn","cu","mn","se","na",
-  "choline","b5","chol","satfat","mufa","pufa","o3","o6","bcar","lutzea","lyco"];
+  "choline","b5","chol","satfat","mufa","pufa","o3","o6","bcar","lutzea","lyco",
+  "his","ile","leu","lys","saa","aaa","thr","trp","val"];
 
 function parseCSVLine(line) {
   const out = []; let cur = "", q = false;
@@ -81,14 +90,14 @@ async function main() {
     if (!line) continue;
     const f = parseCSVLine(line);
     const fdc = f[1], nid = f[2], amt = f[3];
-    const isO3 = O3_IDS.has(nid);
+    const sumKey = SUM_MAP[nid];
     const key = ID_NUT[nid];
-    if (!key && !isO3) continue;
+    if (!key && !sumKey) continue;
     const food = foods[fdc];
     if (!food) continue;
     const v = parseFloat(amt);
     if (isNaN(v)) continue;
-    if (isO3) food.nut.o3 = (food.nut.o3 || 0) + v;   // sum omega-3 components
+    if (sumKey) food.nut[sumKey] = (food.nut[sumKey] || 0) + v;   // summed group
     else food.nut[key] = v;
   }
 
@@ -165,6 +174,17 @@ const DAILY_VALUES = {
   bcar:   { label: "Beta-carotene",        unit: "mcg", dv: null },
   lutzea: { label: "Lutein + zeaxanthin",  unit: "mcg", dv: null },
   lyco:   { label: "Lycopene",             unit: "mcg", dv: null },
+  // Essential amino acids. Targets = IOM (2005) requirements for a ~70 kg adult
+  // (mg/kg/day × 70), in grams; ai:true since these aren't FDA Daily Values.
+  his: { label: "Histidine",                unit: "g", dv: 0.98, ai: true },
+  ile: { label: "Isoleucine",               unit: "g", dv: 1.33, ai: true },
+  leu: { label: "Leucine",                  unit: "g", dv: 2.94, ai: true },
+  lys: { label: "Lysine",                   unit: "g", dv: 2.66, ai: true },
+  saa: { label: "Methionine + Cysteine",    unit: "g", dv: 1.33, ai: true },
+  aaa: { label: "Phenylalanine + Tyrosine", unit: "g", dv: 2.31, ai: true },
+  thr: { label: "Threonine",                unit: "g", dv: 1.40, ai: true },
+  trp: { label: "Tryptophan",               unit: "g", dv: 0.35, ai: true },
+  val: { label: "Valine",                   unit: "g", dv: 1.68, ai: true },
 };
 
 const MACRO_KEYS = ["p", "c", "f", "fib"];
@@ -172,6 +192,7 @@ const MICRO_KEYS = ["vita","vitc","vitd","vite","vitk","b1","b2","b3","b5","b6",
                     "fol","b12","ca","fe","mg","ph","k","zn","cu","mn","se","choline"];
 const FAT_KEYS = ["satfat", "mufa", "pufa", "o3", "o6", "chol"];
 const CAROT_KEYS = ["bcar", "lutzea", "lyco"];
+const AMINO_KEYS = ["his", "ile", "leu", "lys", "saa", "aaa", "thr", "trp", "val"];
 const LIMIT_KEYS = ["na"];
 
 const NUT_ORDER = ${JSON.stringify(NUT_ORDER)};

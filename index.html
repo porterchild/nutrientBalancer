@@ -61,6 +61,9 @@
   .food-opt:last-child { border-bottom:none; }
   .food-opt:hover, .food-opt.active { background:#eef2ff; }
   .food-opt .opt-grp { color:var(--muted); font-size:.72rem; white-space:nowrap; }
+  .opt-in { display:inline-block; margin-left:6px; padding:0 5px; border-radius:8px;
+            background:#e0e7ff; color:var(--accent); font-size:.66rem; font-weight:600;
+            text-transform:uppercase; letter-spacing:.02em; vertical-align:middle; }
   .food-opt.none { color:var(--muted); cursor:default; justify-content:flex-start; }
   .link-btn { background:none; color:#dc2626; padding:0; font-weight:500; font-size:.85rem; }
   .link-btn:hover { background:none; text-decoration:underline; }
@@ -78,11 +81,30 @@
   .food-legend .legend-title { width:100%; margin-bottom:2px; }
   .food-chip { font-size:.85rem; white-space:nowrap; }
   h4.sub { margin:16px 0 6px; font-size:.9rem; color:var(--muted); font-weight:600; }
-  .swap-controls { display:flex; flex-direction:column; gap:8px; margin-bottom:6px; }
-  .swap-ctl { display:flex; align-items:center; gap:8px; }
+  .swap-controls { display:flex; flex-direction:column; gap:10px; margin-bottom:6px; }
+  .swap-ctl { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
   .swap-ctl .swatch { flex:0 0 auto; }
-  .swap-ctl .swap-select { flex:1; min-width:0; }
+  .swap-ctl .swap-select { flex:1 1 240px; min-width:0; }
+  .swap-ctl .swap-search { flex:1 1 200px; min-width:140px; position:relative; }
   .swap-preview { border-top:1px solid var(--line); margin-top:10px; padding-top:4px; }
+  .compare-inputs { display:flex; gap:16px; flex-wrap:wrap; }
+  .compare-side { flex:1 1 240px; min-width:200px; }
+  .cmp-search-a, .cmp-search-b { position:relative; }
+  .cmp-g { display:block; font-size:.8rem; color:var(--muted); margin-top:6px; }
+  .cmp-g input { width:80px; margin-left:4px; }
+  .cmp-table { width:100%; border-collapse:collapse; margin-top:16px; font-size:.9rem; }
+  .cmp-table th, .cmp-table td { padding:5px 8px; text-align:left; border-bottom:1px solid #f1f3f5; vertical-align:top; }
+  .cmp-table thead th { border-bottom:2px solid var(--line); width:38%; }
+  .cmp-table thead th:first-child { width:24%; }
+  .cmp-name { font-weight:600; color:var(--ink); }
+  .cmp-group td { background:#f7f8fa; font-weight:600; font-size:.78rem; text-transform:uppercase;
+                  letter-spacing:.03em; color:var(--muted); }
+  .cmp-lbl { color:var(--ink); }
+  .cmp-val { font-variant-numeric:tabular-nums; }
+  .cmp-val.cmp-hi { color:#15803d; }              /* ≥10% gap: green */
+  .cmp-val.cmp-bold { font-weight:700; }          /* ≥50% gap: bold */
+  .cmp-val.cmp-xl { font-size:1.25em; }           /* ≥100% gap: larger */
+  .cmp-dv { color:var(--muted); font-size:.8em; }
   svg rect[fill]:not([fill="#eef0f3"]):hover { opacity:.82; }
   ol.swaps li { margin-bottom:10px; }
   details { margin-top:10px; } summary { cursor:pointer; font-weight:600; }
@@ -135,6 +157,8 @@
   <button id="calculate">Calculate & balance</button>
 
   <div id="results" style="margin-top:24px"></div>
+
+  <div class="card" id="compare"></div>
 </main>
 
 <footer>
