@@ -69,6 +69,11 @@
   .link-btn:hover { background:none; text-decoration:underline; }
   .muted { color:var(--muted); font-size:.9rem; }
   .ok { color:#15803d; font-weight:600; }
+  .loading { display:flex; align-items:center; gap:12px; color:var(--muted);
+             font-size:.95rem; padding:28px 4px; }
+  .spinner { width:22px; height:22px; flex:0 0 auto; border:3px solid var(--line);
+             border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
   #calculate { width:100%; padding:12px; font-size:1rem; margin-top:4px; }
   .chart-flex { display:flex; gap:24px; align-items:center; flex-wrap:wrap; }
   .legend-title { font-weight:600; margin-bottom:6px; }

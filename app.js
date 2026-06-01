@@ -70,7 +70,11 @@ const EXCLUDED_GROUPS = new Set([
   "Quality Control Materials", "Alcoholic Beverages",
 ]);
 const EXCLUDE_NAME_RE =
-  /powder|dried|dehydrated|\bdry\b|infant formula|formula,|leavening|, mix\b|\bmix,|formulated|fortified|concentrate|freeze[- ]dried|extract|bouillon|baby ?food/i;
+  /powder|dried|dehydrated|\bdry\b|\bflour\b|\bmeal\b|defatted|infant formula|formula,|leavening|, mix\b|\bmix,|formulated|fortified|concentrate|freeze[- ]dried|extract|bouillon|baby ?food/i;
+// Whole nuts/seeds are normally listed as "kernels, dried" / "dry roasted", so
+// the generic dried/dry filter would wrongly drop them. For this culinary class
+// we only reject the truly processed forms (flour/meal/defatted/powder/paste).
+const NUTSEED_EXCLUDE_RE = /\bflour\b|\bmeal\b|defatted|powder|paste|\bmix\b/;
 
 // To keep recommendations to foods people actually eat (not grape leaves,
 // dandelion greens, lambsquarters, emu…), a candidate's primary food noun must
@@ -129,10 +133,9 @@ function isCommonFood(food) {
 }
 
 function isRecommendable(food) {
-  return food.kcal > 0 &&
-    !EXCLUDED_GROUPS.has(food.group) &&
-    !EXCLUDE_NAME_RE.test(food.name) &&
-    isCommonFood(food);
+  if (!(food.kcal > 0) || EXCLUDED_GROUPS.has(food.group) || !isCommonFood(food)) return false;
+  if (culinaryGroup(food) === "nuts & seeds") return !NUTSEED_EXCLUDE_RE.test(food._lc);
+  return !EXCLUDE_NAME_RE.test(food.name);
 }
 
 // Precompute the candidate pool once (FOODS is available from foods.js).
@@ -148,11 +151,15 @@ function addScaled(total, idx, grams, sign) {
   return out;
 }
 
-// Penalty score for a daily profile: how far below DV across micros (capped),
-// plus penalties for exceeding calorie target and sodium limit.
+// Nutrients the optimizer tries to bring to 100%: micronutrients + the
+// essential amino acids (both have DV/requirement targets via dvFraction).
+const TARGET_KEYS = [...MICRO_KEYS, ...AMINO_KEYS];
+
+// Penalty score for a daily profile: how far below target across all tracked
+// nutrients (capped), plus penalties for exceeding calorie target and sodium.
 function deficiencyScore(daily, days, kcalTarget) {
   let score = 0;
-  for (const k of MICRO_KEYS) {
+  for (const k of TARGET_KEYS) {
     const frac = dvFraction(daily, k);
     if (frac < 1) score += (1 - frac);          // reward closing the gap
   }
@@ -167,16 +174,16 @@ function deficiencyScore(daily, days, kcalTarget) {
   return score;
 }
 
-function deficientMicros(daily) {
-  return MICRO_KEYS.filter(k => dvFraction(daily, k) < DEFICIT_EPS);
+function deficientTargets(daily) {
+  return TARGET_KEYS.filter(k => dvFraction(daily, k) < DEFICIT_EPS);
 }
 
 // Describe a before→after change in terms of the gaps it actually closes: only
-// nutrients that were BELOW DV, and only the portion of the shortfall filled
-// (capped at 100% so overshoot doesn't inflate the number). This matches what
-// the ranking rewards, so the label explains why a swap was suggested.
+// nutrients that were BELOW target, and only the portion of the shortfall
+// filled (capped at 100% so overshoot doesn't inflate the number). This matches
+// what the ranking rewards, so the label explains why a swap was suggested.
 function gapClosedGains(beforeDaily, afterDaily, limit = 2) {
-  return MICRO_KEYS
+  return TARGET_KEYS
     .map(k => {
       const base = dvFraction(beforeDaily, k);
       if (base >= DEFICIT_EPS) return null;                 // wasn't deficient
@@ -189,6 +196,29 @@ function gapClosedGains(beforeDaily, afterDaily, limit = 2) {
     .map(g => `${DAILY_VALUES[g.k].label} +${Math.round(g.closed * 100)}%`);
 }
 
+// "Do no harm": coverage a swap GIVES UP, counting surplus down to a buffer
+// (BUFFER_CAP) so the optimizer won't gut a well-met, hard-to-get nutrient (e.g.
+// take vitamin D from 700% to 0%) just to nudge a couple of others. Returned in
+// the same units as the deficiency score and subtracted from a swap's gain.
+const BUFFER_CAP = 1.25;   // value coverage as "kept" up to 125% of target
+const LOSS_WEIGHT = 1.5;   // how heavily to weight lost coverage vs. gained
+function coverageLost(before, after) {
+  let lost = 0;
+  for (const k of TARGET_KEYS) {
+    const d = Math.min(dvFraction(before, k), BUFFER_CAP) - Math.min(dvFraction(after, k), BUFFER_CAP);
+    if (d > 0) lost += d;
+  }
+  return lost;
+}
+
+// Net benefit of a swap: how much it lowers the deficiency score, minus a
+// penalty for coverage it sacrifices. Higher is better; >0 means worth doing.
+// `beforeScore` is precomputed (it's constant across candidates in a loop).
+function swapBenefit(beforeDaily, beforeScore, afterDaily, days, kcalTarget) {
+  return beforeScore - deficiencyScore(afterDaily, days, kcalTarget)
+    - LOSS_WEIGHT * coverageLost(beforeDaily, afterDaily);
+}
+
 // Produce a sequence of recommended swaps. Returns { swaps, finalMeals }.
 function optimize(baseMeals, days) {
   let working = baseMeals.map(m => ({ ...m }));
@@ -199,10 +229,10 @@ function optimize(baseMeals, days) {
 
   for (let step = 0; step < MAX_SWAPS; step++) {
     const dailyNow = perDay(total, days);
-    if (deficientMicros(dailyNow).length === 0) break;
+    if (deficientTargets(dailyNow).length === 0) break;
     const scoreNow = deficiencyScore(dailyNow, days, kcalTarget);
 
-    let best = null; // { mealPos, addIdx, addGrams, newScore }
+    let best = null; // { mealPos, addIdx, addGrams, benefit }
 
     for (let pos = 0; pos < working.length; pos++) {
       if (swapped.has(pos)) continue;  // each logged food is swapped at most once
@@ -219,12 +249,11 @@ function optimize(baseMeals, days) {
         let grams = removedKcal > 0 ? (removedKcal / addFood.kcal) * 100 : 100;
         grams = Math.max(20, Math.min(MAX_SERVING_G, grams));
 
-        const trialTotal = addScaled(without, addIdx, grams, +1);
-        const trialScore = deficiencyScore(perDay(trialTotal, days), days, kcalTarget);
+        const dailyTrial = perDay(addScaled(without, addIdx, grams, +1), days);
+        const benefit = swapBenefit(dailyNow, scoreNow, dailyTrial, days, kcalTarget);
 
-        if (trialScore < scoreNow - 1e-6 &&
-            (!best || trialScore < best.newScore)) {
-          best = { mealPos: pos, addIdx, addGrams: grams, newScore: trialScore };
+        if (benefit > 1e-6 && (!best || benefit > best.benefit)) {
+          best = { mealPos: pos, addIdx, addGrams: grams, benefit };
         }
       }
     }
@@ -264,10 +293,32 @@ function foodSig(food) {
   return (food._sig = ranked.slice(0, 2).map(x => x[0]).sort().join(","));
 }
 
+// Culinary class for "recipe-sensible" swaps — mostly the USDA food group, but
+// nuts, seeds and nut/seed butters are merged (peanut butter is a USDA legume
+// but culinarily a nut butter), so e.g. almonds count as a swap for peanut
+// butter. Used to reserve a few slots for foods that fit the same recipe role.
+function culinaryGroup(food) {
+  const lc = food._lc || (food._lc = food.name.toLowerCase());
+  // Real nuts/seeds (USDA group) plus peanuts/peanut butter (USDA files those
+  // under legumes, but they're culinarily nut butters). Note: legumes named
+  // "…, mature seeds, …" must NOT match here.
+  if (food.group === "Nut and Seed Products" || /peanut|nut butter/.test(lc))
+    return "nuts & seeds";
+  return food.group;
+}
+
+// Distinguishes distinct foods (almonds vs walnuts, cheddar vs cottage) for the
+// recipe slots, so we don't list five variants of the same thing.
+function recipeKey(food) {
+  const segs = food._segs || (food._segs = food._lc.split(",").map(s => s.trim()));
+  return segs.slice(0, 2).join(",");
+}
+
 // Top-N calorie-matched replacements for the food at `pos`, ranked by how much
-// each improves the WHOLE-diet balance (other foods held fixed), then DEDUPED
-// by nutrient signature for variety. Each result carries the calorie-matched
-// grams and a short "biggest gain" label.
+// each improves the WHOLE-diet balance (other foods held fixed). The first ~7
+// slots are the best diverse picks (deduped by nutrient signature); the LAST 3
+// are reserved for "recipe-sensible" swaps in the same culinary class as the
+// food being replaced (e.g. cheddar → cottage cheese, peanut butter → almonds).
 function topReplacements(meals, pos, days, n = 10) {
   const baseTotal = totals(meals);
   const baseDaily = perDay(baseTotal, days);
@@ -276,32 +327,58 @@ function topReplacements(meals, pos, days, n = 10) {
   const item = meals[pos];
   const removedKcal = (FOODS[item.foodIndex].kcal * item.grams) / 100;
   const without = addScaled(baseTotal, item.foodIndex, item.grams, -1);
+  const origGroup = culinaryGroup(FOODS[item.foodIndex]);
 
   const cands = [];
   for (const addIdx of SWAP_CANDIDATES) {
     if (addIdx === item.foodIndex) continue;
     let grams = removedKcal > 0 ? (removedKcal / FOODS[addIdx].kcal) * 100 : 100;
     grams = Math.max(20, Math.min(MAX_SERVING_G, grams));
-    const trialTotal = addScaled(without, addIdx, grams, +1);
-    const improvement = scoreNow - deficiencyScore(perDay(trialTotal, days), days, kcalTarget);
+    const trialDaily = perDay(addScaled(without, addIdx, grams, +1), days);
+    const improvement = swapBenefit(baseDaily, scoreNow, trialDaily, days, kcalTarget);
     cands.push({ addIdx, grams, improvement });
   }
   cands.sort((a, b) => b.improvement - a.improvement);
-  const top = [], seen = new Set();
+
+  const nRecipe = 3, nGlobal = n - nRecipe;
+  const seenSig = new Set(), seenIdx = new Set();
+
+  // Global phase: best diverse picks (signature dedup).
+  const global = [];
   for (const cand of cands) {
-    if (top.length >= n) break;
+    if (global.length >= nGlobal) break;
     const sig = foodSig(FOODS[cand.addIdx]);
-    if (seen.has(sig)) continue;     // skip near-duplicate nutrient profiles
-    seen.add(sig);
-    top.push(cand);
+    if (seenSig.has(sig)) continue;
+    seenSig.add(sig); seenIdx.add(cand.addIdx); global.push(cand);
   }
 
+  // Recipe phase: improving swaps in the same culinary class, distinct foods.
+  const recipe = [], seenRecipe = new Set();
+  for (const cand of cands) {
+    if (recipe.length >= nRecipe) break;
+    if (cand.improvement <= 0 || seenIdx.has(cand.addIdx)) continue;
+    if (culinaryGroup(FOODS[cand.addIdx]) !== origGroup) continue;
+    const rk = recipeKey(FOODS[cand.addIdx]);
+    if (seenRecipe.has(rk)) continue;
+    seenRecipe.add(rk); seenIdx.add(cand.addIdx);
+    recipe.push({ ...cand, recipe: true });
+  }
+
+  // Backfill global if recipe came up short, so the list stays ~n long.
+  for (const cand of cands) {
+    if (global.length + recipe.length >= n) break;
+    const sig = foodSig(FOODS[cand.addIdx]);
+    if (seenSig.has(sig) || seenIdx.has(cand.addIdx)) continue;
+    seenSig.add(sig); seenIdx.add(cand.addIdx); global.push(cand);
+  }
+
+  const result = [...global, ...recipe];
   // Annotate each with the deficient-nutrient gaps it closes most (why it ranks).
-  for (const cand of top) {
+  for (const cand of result) {
     const trialDaily = perDay(addScaled(without, cand.addIdx, cand.grams, +1), days);
     cand.gainText = gapClosedGains(baseDaily, trialDaily, 2).join(", ");
   }
-  return top;
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -504,10 +581,20 @@ function collectMeals() {
   return out;
 }
 
+// Click handler: show a spinner, then run the (synchronous, multi-second)
+// calculation AFTER a paint so the spinner is actually visible.
+function runCalculate() {
+  const results = document.getElementById("results");
+  results.innerHTML =
+    `<div class="loading"><span class="spinner"></span> Crunching the numbers…</div>`;
+  requestAnimationFrame(() => requestAnimationFrame(renderResults));
+}
+
 function renderResults() {
   const days = Math.max(1, Number(document.getElementById("days").value) || 1);
   const meals = collectMeals();
   if (meals.length === 0) {
+    document.getElementById("results").innerHTML = "";   // clear the spinner
     alert("Add at least one food (with a serving size in grams) first.");
     return;
   }
@@ -533,12 +620,12 @@ function renderResults() {
     <div class="card" id="swapExplorer"></div>`;
 
   // Optimizer
-  const deficient = deficientMicros(daily);
+  const deficient = deficientTargets(daily);
   html += `<div class="card"><h3>Recommendations</h3>`;
   if (deficient.length === 0) {
-    html += `<p class="ok">🎉 You're at or above 100% DV for all tracked micronutrients. Nice balance!</p>`;
+    html += `<p class="ok">🎉 You're at or above target for all tracked micronutrients and amino acids. Nice balance!</p>`;
   } else {
-    html += `<p>Below 100% DV: <strong>${deficient.map(k => DAILY_VALUES[k].label).join(", ")}</strong>.</p>`;
+    html += `<p>Below target: <strong>${deficient.map(k => DAILY_VALUES[k].label).join(", ")}</strong>.</p>`;
     const { swaps, finalMeals } = optimize(meals, days);
     if (swaps.length === 0) {
       html += `<p class="muted">No single-food swap in the database improves your coverage without overshooting calorie/sodium limits. Consider adding a serving of a nutrient-dense food (e.g. beef liver, oysters, sardines, spinach, pumpkin seeds, fortified cereal).</p>`;
@@ -553,8 +640,8 @@ function renderResults() {
       html += `</ol>`;
       const finalDaily = perDay(totals(finalMeals), days);
       const finalPerFood = perFoodContribs(finalMeals, days);
-      const stillLow = deficientMicros(finalDaily);
-      html += `<p class="muted">After these swaps: ${MICRO_KEYS.length - stillLow.length}/${MICRO_KEYS.length} micros at 100%+ DV` +
+      const stillLow = deficientTargets(finalDaily);
+      html += `<p class="muted">After these swaps: ${TARGET_KEYS.length - stillLow.length}/${TARGET_KEYS.length} nutrients at 100%+ target` +
         (stillLow.length ? `; still low: ${stillLow.map(k => DAILY_VALUES[k].label).join(", ")}.` : `. All targets met!`) + `</p>`;
       html += `<details><summary>Projected micronutrient chart after swaps</summary>` +
         `${foodLegend(finalMeals, "Foods after swaps")}${dvBars(MICRO_KEYS, finalDaily, finalMeals, finalPerFood)}</details>`;
@@ -573,7 +660,7 @@ function mountSwapExplorer(meals, days) {
   const box = document.getElementById("swapExplorer");
   if (!box) return;
   const baseDaily = perDay(totals(meals), days);
-  const baseMet = MICRO_KEYS.length - deficientMicros(baseDaily).length;
+  const baseMet = TARGET_KEYS.length - deficientTargets(baseDaily).length;
   const selection = {};                       // pos -> { addIdx, grams } or absent
   const customByPos = {};                     // pos -> last food picked via search
   const replacementsByPos = meals.map((_, pos) => topReplacements(meals, pos, days, 10));
@@ -595,13 +682,19 @@ function mountSwapExplorer(meals, days) {
   meals.forEach((m, pos) => {
     const ctl = document.createElement("div");
     ctl.className = "swap-ctl";
-    const opts = [`<option value="">Keep — ${escapeHtml(FOODS[m.foodIndex].name)} (${Math.round(m.grams)} g)</option>`]
-      .concat(replacementsByPos[pos].map((c, i) =>
-        `<option value="${i}">→ ${escapeHtml(FOODS[c.addIdx].name)} (${Math.round(c.grams)} g)` +
-        `${c.gainText ? ` · ${c.gainText}` : ""}</option>`));
+    const reps = replacementsByPos[pos];
+    const optOf = (c, i) =>
+      `<option value="${i}">→ ${escapeHtml(FOODS[c.addIdx].name)} (${Math.round(c.grams)} g)` +
+      `${c.gainText ? ` · ${c.gainText}` : ""}</option>`;
+    const globalOpts = reps.map((c, i) => ({ c, i })).filter(x => !x.c.recipe).map(x => optOf(x.c, x.i)).join("");
+    const recipeOpts = reps.map((c, i) => ({ c, i })).filter(x => x.c.recipe).map(x => optOf(x.c, x.i)).join("");
     ctl.innerHTML =
       `<span class="swatch" style="background:${colorFor(pos)}"></span>` +
-      `<select class="swap-select" data-pos="${pos}">${opts.join("")}</select>`;
+      `<select class="swap-select" data-pos="${pos}">` +
+        `<option value="">Keep — ${escapeHtml(FOODS[m.foodIndex].name)} (${Math.round(m.grams)} g)</option>` +
+        `<optgroup label="Best for your gaps">${globalOpts}</optgroup>` +
+        (recipeOpts ? `<optgroup label="Similar foods (recipe-friendly)">${recipeOpts}</optgroup>` : "") +
+      `</select>`;
     const sel = ctl.querySelector("select");
 
     // Search box: try ANY food. A pick adds/updates a "✎ custom" option on the
@@ -634,14 +727,14 @@ function mountSwapExplorer(meals, days) {
       selection[i] ? { foodIndex: selection[i].addIdx, grams: selection[i].grams } : m);
     const newDaily = perDay(totals(newMeals), days);
     const perFood = perFoodContribs(newMeals, days);
-    const met = MICRO_KEYS.length - deficientMicros(newDaily).length;
+    const met = TARGET_KEYS.length - deficientTargets(newDaily).length;
     const nSwaps = Object.keys(selection).length;
     const naPct = Math.round(newDaily.na / DAILY_VALUES.na.dv * 100);
-    const metDelta = met === baseMet ? `${met}/${MICRO_KEYS.length}`
-      : `${baseMet} → <strong>${met}</strong>/${MICRO_KEYS.length}`;
+    const metDelta = met === baseMet ? `${met}/${TARGET_KEYS.length}`
+      : `${baseMet} → <strong>${met}</strong>/${TARGET_KEYS.length}`;
     preview.innerHTML =
       `<p class="muted" style="margin:14px 0 6px">${nSwaps ? `Previewing ${nSwaps} swap${nSwaps > 1 ? "s" : ""}` : "No swaps selected (showing your current balance)"} — ` +
-      `${Math.round(newDaily.kcal)} kcal/day · Sodium ${naPct}% · micros at 100% DV: ${metDelta}</p>` +
+      `${Math.round(newDaily.kcal)} kcal/day · Sodium ${naPct}% · nutrients at target: ${metDelta}</p>` +
       foodLegend(newMeals, "Foods in this scenario") +
       dvBars(MICRO_KEYS, newDaily, newMeals, perFood);
   }
@@ -714,7 +807,7 @@ function mountCompare() {
   if (!box) return;
   let idxA = null, idxB = null;
   box.innerHTML = `<h3>Compare two ingredients</h3>
-    <p class="muted">Pick two foods to see their nutrients side by side — independent of your logged diet.</p>
+    <p class="muted">Pick two foods to see their nutrients side by side — independent of your logged diet. The second serving is auto-set to match the first's calories; edit either freely.</p>
     <div class="compare-inputs">
       <div class="compare-side"><div class="cmp-search-a"></div>
         <label class="cmp-g">grams <input class="cmp-grams cmp-grams-a" type="number" min="1" step="1" value="100"></label></div>
@@ -722,11 +815,21 @@ function mountCompare() {
         <label class="cmp-g">grams <input class="cmp-grams cmp-grams-b" type="number" min="1" step="1" value="100"></label></div>
     </div>
     <div class="compare-result"></div>`;
-  const sa = buildFoodSearch(i => { idxA = i; render(); }, { keepValue: true, placeholder: "search first food…" });
-  const sb = buildFoodSearch(i => { idxB = i; render(); }, { keepValue: true, placeholder: "search second food…" });
+  const gA = box.querySelector(".cmp-grams-a"), gB = box.querySelector(".cmp-grams-b");
+
+  // Set B's serving to the same calories as A's current serving (A is the
+  // reference). Runs when either food is picked, not on manual grams edits.
+  function matchBtoA() {
+    if (idxA == null || idxB == null) return;
+    const kcalA = FOODS[idxA].kcal * (Number(gA.value) || 0) / 100;
+    const kB = FOODS[idxB].kcal;
+    if (kcalA > 0 && kB > 0) gB.value = Math.max(1, Math.round(kcalA / kB * 100));
+  }
+
+  const sa = buildFoodSearch(i => { idxA = i; matchBtoA(); render(); }, { keepValue: true, placeholder: "search first food…" });
+  const sb = buildFoodSearch(i => { idxB = i; matchBtoA(); render(); }, { keepValue: true, placeholder: "search second food…" });
   box.querySelector(".cmp-search-a").appendChild(sa.wrap);
   box.querySelector(".cmp-search-b").appendChild(sb.wrap);
-  const gA = box.querySelector(".cmp-grams-a"), gB = box.querySelector(".cmp-grams-b");
   gA.addEventListener("input", render);
   gB.addEventListener("input", render);
 
@@ -1118,7 +1221,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("addRow").addEventListener("click", () => addMealRow());
   document.getElementById("clearAll").addEventListener("click", clearAll);
   document.getElementById("days").addEventListener("input", saveState);
-  document.getElementById("calculate").addEventListener("click", renderResults);
+  document.getElementById("calculate").addEventListener("click", runCalculate);
   document.getElementById("saveDiet").addEventListener("click", saveCurrentDiet);
   document.getElementById("loadDiet").addEventListener("click", loadSavedDiet);
   document.getElementById("deleteDiet").addEventListener("click", deleteSavedDiet);

@@ -45,16 +45,20 @@ the others.
      as the micros) — the 9 indispensable amino acids vs. IOM requirements for a
      ~70 kg adult (Met+Cys and Phe+Tyr grouped as in protein-quality scoring),
    - a **"What If I Swapped…" explorer** — per logged food, a dropdown of its
-     top 10 calorie-matched replacements (deduped by nutrient profile for variety,
-     so you don't get ten kinds of liver) **plus a search box to try any food** in
-     the database. Each suggestion is labeled with the deficient-nutrient gaps it
-     closes. Pick replacements for one or more foods and the balance preview (and
-     "micros at 100% DV: X → Y") updates live.
+     top 10 calorie-matched replacements **plus a search box to try any food**.
+     The list is split into **"Best for your gaps"** (7 diverse highest-impact
+     picks, deduped by nutrient profile so you don't get ten kinds of liver) and
+     **"Similar foods (recipe-friendly)"** (3 swaps in the same culinary class —
+     e.g. cheddar → cottage cheese, peanut butter → sunflower seeds — so they're
+     realistic to cook with). Each is labeled with the deficient-nutrient gaps it
+     closes. Pick replacements and the balance preview ("nutrients at target:
+     X → Y") updates live.
    - automatic **swap recommendations** to close any gaps.
 
 There's also a standalone **Compare two ingredients** card (independent of your
-logged diet): pick two foods and serving sizes to see every nutrient side by
-side, with %DV and the higher value highlighted.
+logged diet): pick two foods to see every nutrient side by side, with %DV and
+the higher value highlighted. The first food defaults to 100 g and the second is
+auto-set to **calorie-match** it (edit either serving freely).
 
 ## How the recommendations work
 
@@ -73,9 +77,14 @@ swaps**:
   You can still **log** any of the 7,793 foods; this only constrains *suggestions*.
 - It recomputes the **full daily totals** for that trial (so the lost nutrients
   from the removed food are fully accounted for).
-- It scores each trial by how much it closes the gap on micros that are below
-  100% DV, while penalizing going over the sodium limit or drifting from your
-  calorie level.
+- It scores each trial by how much it closes the gap on nutrients below target —
+  the 22 micronutrients **and the 9 essential amino acids** — while penalizing
+  going over the sodium limit or drifting from your calorie level.
+- It also applies a **"do no harm" penalty**: a swap is charged for coverage it
+  *gives up* (counting surplus down to a 125% buffer), so it won't gut a well-met,
+  hard-to-get nutrient — e.g. take vitamin D from 700% to 0% — just to nudge a
+  couple of others. A swap is only suggested if its gains clearly outweigh what
+  it costs; if nothing qualifies, it says so rather than recommending a harmful trade.
 - It greedily applies the single best swap, then repeats, recomputing every
   time. **Each logged food is swapped at most once** (no swapping a food it just
   swapped in), so you get at most one suggestion per food you logged. The result
