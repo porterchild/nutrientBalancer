@@ -1040,9 +1040,27 @@ const STORE_KEY = "nutrientBalancer.v1";
 let restoring = false;
 let draggingRow = null;
 
-// Which row should the dragged row be inserted *before*, given the cursor Y?
+// Wire a drag handle so its host element (a meal row OR a meal-section divider)
+// can be dragged to reorder. Both carry the `drag-item` class so they reorder
+// together. The element itself isn't draggable, so its inputs stay clickable.
+function wireDragHandle(el) {
+  const handle = el.querySelector(".drag-handle");
+  handle.addEventListener("dragstart", e => {
+    draggingRow = el;
+    el.classList.add("dragging");
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", "");   // Firefox needs data set
+  });
+  handle.addEventListener("dragend", () => {
+    el.classList.remove("dragging");
+    draggingRow = null;
+    saveState();                                 // persist new order
+  });
+}
+
+// Which item should the dragged item be inserted *before*, given the cursor Y?
 function rowAfterCursor(container, y) {
-  const others = [...container.querySelectorAll(".meal-row:not(.dragging)")];
+  const others = [...container.querySelectorAll(".drag-item:not(.dragging)")];
   let closest = null, closestDist = -Infinity;
   for (const r of others) {
     const box = r.getBoundingClientRect();
@@ -1052,27 +1070,56 @@ function rowAfterCursor(container, y) {
   return closest;
 }
 
-// Serialize the current on-screen rows + days into a plain object.
+// Serialize the on-screen items (foods AND meal-section dividers, in order) +
+// days. Dividers are stored as { divider: "<label>" }; food rows keep their
+// existing { food, grams, mult } shape, so old saves still load.
 function currentRowsData() {
-  const rows = [...document.querySelectorAll(".meal-row")].map(r => ({
-    food: r.querySelector(".food-search").value,
-    grams: r.querySelector(".grams").value,
-    mult: r.querySelector(".mult").value,
-  }));
+  const rows = [...document.getElementById("mealRows").children].map(el => {
+    if (el.classList.contains("meal-divider")) {
+      return { divider: el.querySelector(".divider-label").value };
+    }
+    return {
+      food: el.querySelector(".food-search").value,
+      grams: el.querySelector(".grams").value,
+      mult: el.querySelector(".mult").value,
+    };
+  });
   const daysEl = document.getElementById("days");
   return { rows, days: daysEl ? daysEl.value : "1" };
 }
 
 // Rebuild the UI from a saved data object, then persist it as the working set.
+// An item with a `divider` field is a section header; everything else is a food
+// row (so saves made before dividers existed still restore correctly).
 function applyState(data) {
   restoring = true;
   document.getElementById("mealRows").innerHTML = "";
   document.getElementById("days").value = (data && data.days) || "1";
   const rows = (data && data.rows) || [];
-  if (rows.length) rows.forEach(r => addMealRow(r, false));
+  if (rows.length) rows.forEach(r => r.divider != null ? addDivider(r.divider, false)
+                                                       : addMealRow(r, false));
   else addMealRow(undefined, false);
   restoring = false;
   saveState();
+}
+
+// Append a draggable meal-section divider (Breakfast / Lunch / …). Purely
+// organizational — collectMeals ignores it, so it never affects the nutrients.
+function addDivider(label, focus = true) {
+  const div = document.createElement("div");
+  div.className = "meal-divider drag-item";
+  div.innerHTML =
+    `<span class="drag-handle" draggable="true" title="drag to reorder">⠿</span>` +
+    `<input class="divider-label" autocomplete="off" placeholder="meal section…">` +
+    `<button type="button" class="link-btn" title="remove this section" aria-label="remove">✕</button>`;
+  const input = div.querySelector(".divider-label");
+  input.value = label || "";
+  input.addEventListener("input", saveState);
+  div.querySelector(".link-btn").addEventListener("click", () => { div.remove(); saveState(); });
+  wireDragHandle(div);
+  document.getElementById("mealRows").appendChild(div);
+  if (focus) { input.focus(); input.select(); }
+  return div;
 }
 
 function saveState() {
@@ -1139,7 +1186,7 @@ function deleteSavedDiet() {
 // `prefill` = { food, grams, mult } restores a saved row; `focus` auto-focuses it.
 function addMealRow(prefill, focus = true) {
   const row = document.createElement("div");
-  row.className = "meal-row";
+  row.className = "meal-row drag-item";
   row.innerHTML =
     `<span class="drag-handle" draggable="true" title="drag to reorder">⠿</span>` +
     `<div class="food-cell">` +
@@ -1208,20 +1255,8 @@ function addMealRow(prefill, focus = true) {
     saveState();
   });
 
-  // Drag-to-reorder via the handle (rows themselves aren't draggable, so the
-  // inputs stay clickable). Live reordering is handled by the container below.
-  const handle = row.querySelector(".drag-handle");
-  handle.addEventListener("dragstart", e => {
-    draggingRow = row;
-    row.classList.add("dragging");
-    e.dataTransfer.effectAllowed = "move";
-    e.dataTransfer.setData("text/plain", "");   // Firefox needs data set
-  });
-  handle.addEventListener("dragend", () => {
-    row.classList.remove("dragging");
-    draggingRow = null;
-    saveState();                                 // persist new order
-  });
+  // Drag-to-reorder via the handle (live reordering handled by the container).
+  wireDragHandle(row);
 
   document.getElementById("mealRows").appendChild(row);
 
@@ -1253,6 +1288,11 @@ document.addEventListener("DOMContentLoaded", () => {
   mountCompare();                 // standalone ingredient comparison tool
 
   document.getElementById("addRow").addEventListener("click", () => addMealRow());
+  document.getElementById("addDivider").addEventListener("click", () => {
+    const presets = ["Breakfast", "Lunch", "Dinner", "Snacks"];
+    const n = document.querySelectorAll(".meal-divider").length;
+    addDivider(presets[n] || `Meal ${n + 1}`);
+  });
   document.getElementById("clearAll").addEventListener("click", clearAll);
   document.getElementById("days").addEventListener("input", saveState);
   document.getElementById("calculate").addEventListener("click", runCalculate);

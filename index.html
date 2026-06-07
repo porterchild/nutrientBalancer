@@ -42,6 +42,15 @@
   .drag-handle:active { cursor:grabbing; }
   .meal-row.dragging { opacity:.45; }
   .meal-row.drag-over { box-shadow:inset 0 2px 0 0 var(--accent); }
+  /* meal-section dividers — draggable like rows, ignored by the calculation */
+  .meal-divider { display:flex; align-items:center; gap:8px; margin:16px 0 8px;
+                  padding-top:10px; border-top:2px solid var(--line); }
+  .meal-divider.dragging { opacity:.45; }
+  .divider-label { flex:1 1 auto; font-weight:700; font-size:.85rem; letter-spacing:.04em;
+                   text-transform:uppercase; color:var(--accent); background:transparent;
+                   border:1px solid transparent; border-radius:6px; padding:4px 6px; }
+  .divider-label:hover { border-color:var(--line); }
+  .divider-label:focus { border-color:var(--accent); background:#fff; outline:none; }
   .saves-bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center;
                margin-top:14px; padding-top:14px; border-top:1px solid var(--line); }
   .saves-title { font-size:.82rem; color:var(--muted); margin-right:2px; }
@@ -143,6 +152,7 @@
     <div id="mealRows"></div>
     <div style="margin-top:12px; display:flex; gap:10px; align-items:center;">
       <button id="addRow" class="secondary-btn">+ Add another food</button>
+      <button id="addDivider" class="secondary-btn">+ Add meal section</button>
       <button id="clearAll" class="link-btn">Clear all</button>
     </div>
     <div class="saves-bar">
