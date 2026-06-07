@@ -404,6 +404,7 @@ function perFoodContribs(mealList, days) {
 
 // Shared color legend mapping each food to its swatch.
 function foodLegend(mealList, title = "Your foods (chart colors)") {
+  const titleHtml = title ? `<div class="legend-title">${title}</div>` : "";
   const rows = mealList.map((m, i) => {
     const amt = m.mult > 1
       ? `${Math.round(m.baseGrams)} g ×${m.mult} = ${Math.round(m.grams)} g`
@@ -411,7 +412,7 @@ function foodLegend(mealList, title = "Your foods (chart colors)") {
     return `<span class="food-chip" data-food="${i}" title="click to highlight this food across the charts"><span class="swatch" style="background:${colorFor(i)}"></span>` +
       `${escapeHtml(FOODS[m.foodIndex].name)} <span class="muted">(${amt})</span></span>`;
   }).join("");
-  return `<div class="food-legend"><div class="legend-title">${title}</div>${rows}</div>`;
+  return `<div class="food-legend">${titleHtml}${rows}</div>`;
 }
 
 // Stacked horizontal bars showing each food's share of every macro (in grams).
@@ -505,7 +506,7 @@ function macroPie(daily) {
   return `<div class="chart-flex">
       <svg viewBox="0 0 220 220" width="220" height="220" role="img">${paths}</svg>
       <div class="legend">
-        <div class="legend-title">${Math.round(total)} kcal/day from macros</div>
+        <div class="legend-title">Calorie sources</div>
         ${legend}
         <div class="legend-row muted">Fiber: ${Math.round(daily.fib)} g/day (DV ${DAILY_VALUES.fib.dv} g)</div>
       </div>
@@ -548,6 +549,42 @@ function dvBars(keys, daily, mealList, perFood, lineLabel = "100% DV") {
             stroke="#333" stroke-width="1.5" stroke-dasharray="4 3"/>
            <text x="${lineX}" y="${padTop + keys.length * rowH + 16}" text-anchor="middle" class="bar-pct">${lineLabel}</text>`;
   return `<svg viewBox="0 0 ${fullW} ${h}" width="100%" preserveAspectRatio="xMinYMin meet" role="img">${rows}</svg>`;
+}
+
+// Omega-6 : omega-3 ratio shown on a scale. Zones: ideal 1:1–4:1 (green),
+// suboptimal 4–10 (amber), poor/Western 10–20+ (red). A marker sits at the
+// user's actual ratio. Returns "" if neither omega is present.
+function omegaRatioChart(daily) {
+  const o3 = daily.o3, o6 = daily.o6;
+  if (!(o6 > 0) && !(o3 > 0)) return "";
+  const hasRatio = o3 > 0;
+  const r = hasRatio ? o6 / o3 : Infinity;
+  const W = 500, padL = 24, padR = 24, barW = W - padL - padR;
+  const MAX = 20, trackY = 28, trackH = 18;
+  const xOf = v => padL + Math.min(Math.max(v, 0), MAX) / MAX * barW;
+
+  let svg = "";
+  for (const [a, b, color, label] of [
+    [0, 4, "#cdeccd", "ideal"], [4, 10, "#fce6c4", ""], [10, MAX, "#f6cccc", ""],
+  ]) {
+    const x = xOf(a), w = xOf(b) - xOf(a);
+    svg += `<rect x="${x.toFixed(1)}" y="${trackY}" width="${w.toFixed(1)}" height="${trackH}" fill="${color}"/>`;
+    if (label) svg += `<text x="${(x + w / 2).toFixed(1)}" y="${trackY + 13}" text-anchor="middle" class="bar-label" fill="#2f7a2f">${label}</text>`;
+  }
+  svg += `<rect x="${padL}" y="${trackY}" width="${barW}" height="${trackH}" fill="none" stroke="#d4d8de"/>`;
+  for (const t of [4, 10, 15, 20]) {
+    const x = xOf(t);
+    svg += `<line x1="${x.toFixed(1)}" y1="${trackY + trackH}" x2="${x.toFixed(1)}" y2="${trackY + trackH + 4}" stroke="#9aa1ab"/>` +
+           `<text x="${x.toFixed(1)}" y="${trackY + trackH + 16}" text-anchor="middle" class="bar-pct">${t}:1${t === MAX ? "+" : ""}</text>`;
+  }
+  // marker at the actual ratio
+  const mx = xOf(hasRatio ? r : MAX);
+  const mcolor = !hasRatio ? "#b91c1c" : r <= 4 ? "#15803d" : r <= 10 ? "#b45309" : "#b91c1c";
+  const label = !hasRatio ? ">20 : 1 (no ω-3)" : r > MAX ? `${Math.round(r)} : 1` : `${r.toFixed(1)} : 1`;
+  const tx = Math.max(padL + 32, Math.min(W - padL - 32, mx));   // keep label on-canvas
+  svg += `<polygon points="${(mx - 6).toFixed(1)},${trackY - 9} ${(mx + 6).toFixed(1)},${trackY - 9} ${mx.toFixed(1)},${trackY - 1}" fill="${mcolor}"/>` +
+         `<text x="${tx.toFixed(1)}" y="${trackY - 13}" text-anchor="middle" class="bar-label" fill="${mcolor}" style="font-weight:700">${label}</text>`;
+  return `<svg viewBox="0 0 ${W} ${trackY + trackH + 24}" width="100%" preserveAspectRatio="xMinYMin meet" role="img">${svg}</svg>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -633,20 +670,33 @@ function renderResults() {
   const perFood = perFoodContribs(meals, days);
   const results = document.getElementById("results");
 
-  // Summary line
-  const naPct = Math.round(daily.na / DAILY_VALUES.na.dv * 100);
+  // Subheading shown under every section with a hoverable/clickable chart.
+  const HINT = `<h4 class="hint">Hover for info and Click to focus</h4>`;
+
+  // Omega-6 : omega-3 ratio chart. Health consensus: aim for ~4:1 or lower
+  // (ideal 1:1–4:1); typical Western diets run a pro-inflammatory 15–20:1.
+  const omegaChart = omegaRatioChart(daily);
+  const omegaHeading = daily.o3 > 0
+    ? `Omega-6 to Omega-3 ratio is ${fmt(daily.o6)} g to ${fmt(daily.o3)} g, or ${(daily.o6 / daily.o3).toFixed(1)} : 1`
+    : `Omega-6 to Omega-3 ratio is ${fmt(daily.o6)} g to 0 g (no omega-3 logged)`;
+  const omegaRatioHtml = omegaChart
+    ? `<h4 class="sub">${omegaHeading}</h4>${omegaChart}` +
+      `<p class="muted" style="margin:2px 0 0">Aim for 4:1 or lower (ideal 1:1–4:1); typical Western diets run 15–20:1.</p>`
+    : "";
+
+  // Summary line (sodium now lives in the Fats & fatty acids "upper limits" chart)
   let html = `
     <h2>Daily average over ${days} day${days > 1 ? "s" : ""}</h2>
-    <p class="muted">${Math.round(daily.kcal)} kcal/day · Sodium ${Math.round(daily.na)} mg (${naPct}% of ${DAILY_VALUES.na.dv} mg limit)</p>
-    <div class="card">${foodLegend(meals)}<p class="muted" style="margin:0 0 4px">Hover any segment for the exact amount. <strong>Click a food</strong> — in the legend or on any bar — to highlight it across every chart.</p></div>
+    <p class="muted">${Math.round(daily.kcal)} kcal/day</p>
     <div class="card"><h3>Macronutrients</h3>${macroPie(daily)}
-      <h4 class="sub">Where each macro comes from</h4>${macroBars(meals, perFood, daily)}</div>
-    <div class="card"><h3>Micronutrients vs. Daily Value</h3>${dvBars(MICRO_KEYS, daily, meals, perFood)}</div>
-    <div class="card"><h3>Essential amino acids vs. requirement</h3>${dvBars(AMINO_KEYS, daily, meals, perFood, "100% req")}
+      <h4 class="sub">Where each macro comes from</h4>${HINT}${macroBars(meals, perFood, daily)}</div>
+    <div class="card"><h3>Micronutrients vs. Daily Value</h3>${HINT}${dvBars(MICRO_KEYS, daily, meals, perFood)}</div>
+    <div class="card"><h3>Essential amino acids vs. requirement</h3>${HINT}${dvBars(AMINO_KEYS, daily, meals, perFood, "100% req")}
       <p class="muted" style="margin:8px 0 0">Targets are IOM estimated requirements for a ~70 kg adult (they scale with body weight); no FDA Daily Value exists for amino acids. Met+Cys and Phe+Tyr are grouped as in protein-quality scoring.</p></div>
-    <div class="card"><h3>Fats &amp; fatty acids</h3>${stackedNutrientBars(FAT_KEYS, meals, perFood, daily)}
-      <p class="muted" style="margin:8px 0 0">Omega-3/6 use IOM Adequate Intakes (no FDA Daily Value exists); saturated fat &amp; cholesterol are upper limits.</p></div>
-    <div class="card"><h3>Carotenoids (phytonutrients)</h3>${stackedNutrientBars(CAROT_KEYS, meals, perFood, daily)}
+    <div class="card"><h3>Fats &amp; fatty acids</h3>${HINT}${stackedNutrientBars([...FAT_KEYS, "na"], meals, perFood, daily)}
+      ${omegaRatioHtml}
+      <p class="muted" style="margin:8px 0 0">Omega-3/6 use IOM Adequate Intakes (no FDA Daily Value exists); saturated fat, cholesterol &amp; sodium are upper limits.</p></div>
+    <div class="card"><h3>Carotenoids (phytonutrients)</h3>${HINT}${stackedNutrientBars(CAROT_KEYS, meals, perFood, daily)}
       <p class="muted" style="margin:8px 0 0">No Daily Value exists for these; shown as amounts. Beta-carotene also counts toward vitamin A (already included above).</p></div>
     <div class="card" id="swapExplorer"></div>`;
 
@@ -675,7 +725,7 @@ function renderResults() {
       html += `<p class="muted">After these swaps: ${TARGET_KEYS.length - stillLow.length}/${TARGET_KEYS.length} nutrients at 100%+ target` +
         (stillLow.length ? `; still low: ${stillLow.map(k => DAILY_VALUES[k].label).join(", ")}.` : `. All targets met!`) + `</p>`;
       html += `<details><summary>Projected micronutrient chart after swaps</summary>` +
-        `${foodLegend(finalMeals, "Foods after swaps")}${dvBars(MICRO_KEYS, finalDaily, finalMeals, finalPerFood)}</details>`;
+        `${HINT}${foodLegend(finalMeals, "Foods after swaps")}${dvBars(MICRO_KEYS, finalDaily, finalMeals, finalPerFood)}</details>`;
     }
   }
   html += `</div>`;
@@ -768,7 +818,7 @@ function mountSwapExplorer(meals, days) {
     preview.innerHTML =
       `<p class="muted" style="margin:14px 0 6px">${nSwaps ? `Previewing ${nSwaps} swap${nSwaps > 1 ? "s" : ""}` : "No swaps selected (showing your current balance)"} — ` +
       `${Math.round(newDaily.kcal)} kcal/day · Sodium ${naPct}% · nutrients at target: ${metDelta}</p>` +
-      foodLegend(newMeals, "Foods in this scenario") +
+      `<h4 class="hint">Hover for info and Click to focus</h4>` +
       dvBars(MICRO_KEYS, newDaily, newMeals, perFood);
     applyHighlight();    // keep any active highlight after the preview rebuilds
   }

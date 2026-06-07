@@ -103,6 +103,7 @@
   svg .seg-dim { opacity:.16; transition:opacity .12s; }
   svg rect[data-food] { cursor:pointer; }
   h4.sub { margin:16px 0 6px; font-size:.9rem; color:var(--muted); font-weight:600; }
+  h4.hint { margin:-6px 0 12px; font-size:.82rem; font-weight:400; color:var(--muted); }
   .swap-controls { display:flex; flex-direction:column; gap:10px; margin-bottom:6px; }
   .swap-ctl { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
   .swap-ctl .swatch { flex:0 0 auto; }
@@ -141,13 +142,24 @@
 
 <main>
   <div class="card">
-    <h3>1. Add your meals</h3>
+    <h3>1. How many days do these meals cover?</h3>
+    <div class="row">
+      <div style="flex:0 0 160px">
+        <label for="days">Days</label>
+        <input id="days" type="number" min="1" step="1" value="1">
+      </div>
+    </div>
+    <p class="muted">Totals are divided by this to get your average daily intake.</p>
+  </div>
+
+  <div class="card">
+    <h3>2. Add your meals</h3>
     <p class="muted" style="margin-top:0">Start typing a food name — the list filters as you type. Pick a match from the suggestions.</p>
     <div class="rows-head">
       <span></span>
       <span>Food (type to search)</span>
       <span>Serving (g)</span>
-      <span class="mult-head" title="multiplier — e.g. 5 if eaten on 5 days">× multiplier</span>
+      <span class="mult-head" title="days — e.g. 5 if eaten on 5 days">× days</span>
     </div>
     <div id="mealRows"></div>
     <div style="margin-top:12px; display:flex; gap:10px; align-items:center;">
@@ -164,17 +176,6 @@
       <button id="loadDiet" class="secondary-btn">Load</button>
       <button id="deleteDiet" class="link-btn">Delete</button>
     </div>
-  </div>
-
-  <div class="card">
-    <h3>2. How many days do these meals cover?</h3>
-    <div class="row">
-      <div style="flex:0 0 160px">
-        <label for="days">Days</label>
-        <input id="days" type="number" min="1" step="1" value="1">
-      </div>
-    </div>
-    <p class="muted">Totals are divided by this to get your average daily intake.</p>
   </div>
 
   <button id="calculate">Calculate & balance</button>
