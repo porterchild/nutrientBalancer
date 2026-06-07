@@ -408,7 +408,7 @@ function foodLegend(mealList, title = "Your foods (chart colors)") {
     const amt = m.mult > 1
       ? `${Math.round(m.baseGrams)} g ×${m.mult} = ${Math.round(m.grams)} g`
       : `${Math.round(m.grams)} g`;
-    return `<span class="food-chip"><span class="swatch" style="background:${colorFor(i)}"></span>` +
+    return `<span class="food-chip" data-food="${i}" title="click to highlight this food across the charts"><span class="swatch" style="background:${colorFor(i)}"></span>` +
       `${escapeHtml(FOODS[m.foodIndex].name)} <span class="muted">(${amt})</span></span>`;
   }).join("");
   return `<div class="food-legend"><div class="legend-title">${title}</div>${rows}</div>`;
@@ -431,7 +431,7 @@ function macroBars(mealList, perFood, daily) {
         const v = perFood[i][k];
         if (v <= 0) return;
         const w = (v / total) * barW;
-        svg += `<rect x="${x.toFixed(1)}" y="${y + 4}" width="${w.toFixed(1)}" height="16" fill="${colorFor(i)}">` +
+        svg += `<rect x="${x.toFixed(1)}" y="${y + 4}" width="${w.toFixed(1)}" height="16" fill="${colorFor(i)}" data-food="${i}">` +
                `<title>${escapeHtml(FOODS[m.foodIndex].name)}: ${fmt(v)} g (${Math.round(v / total * 100)}% of ${label.toLowerCase()})</title></rect>`;
         x += w;
       });
@@ -460,7 +460,7 @@ function stackedNutrientBars(keys, mealList, perFood, daily) {
         const v = perFood[i][k];
         if (v <= 0) return;
         const w = (v / total) * barW;
-        svg += `<rect x="${x.toFixed(1)}" y="${y + 4}" width="${w.toFixed(1)}" height="16" fill="${colorFor(i)}">` +
+        svg += `<rect x="${x.toFixed(1)}" y="${y + 4}" width="${w.toFixed(1)}" height="16" fill="${colorFor(i)}" data-food="${i}">` +
                `<title>${escapeHtml(FOODS[m.foodIndex].name)}: ${fmt(v)} ${meta.unit} (${Math.round(v / total * 100)}% of ${meta.label.toLowerCase()})</title></rect>`;
         x += w;
       });
@@ -535,7 +535,7 @@ function dvBars(keys, daily, mealList, perFood, lineLabel = "100% DV") {
         const v = perFood[fi][k];
         if (v <= 0) return;
         const w = (v / total) * visW;           // this food's share of the visible bar
-        rows += `<rect x="${x.toFixed(1)}" y="${y + 4}" width="${w.toFixed(1)}" height="16" fill="${colorFor(fi)}">` +
+        rows += `<rect x="${x.toFixed(1)}" y="${y + 4}" width="${w.toFixed(1)}" height="16" fill="${colorFor(fi)}" data-food="${fi}">` +
                 `<title>${escapeHtml(FOODS[m.foodIndex].name)}: ${fmt(v)} ${unit} (${Math.round(v / total * 100)}% of ${DAILY_VALUES[k].label})</title></rect>`;
         x += w;
       });
@@ -555,6 +555,37 @@ function dvBars(keys, daily, mealList, perFood, lineLabel = "100% DV") {
 // ---------------------------------------------------------------------------
 
 function fmt(n) { return n >= 100 ? Math.round(n) : Math.round(n * 10) / 10; }
+
+// --- Click-to-highlight one food across every per-food chart ------------------
+// Each per-food bar segment and each legend chip carries data-food="<i>" (the
+// i-th logged food, same color everywhere via colorFor). Clicking a legend chip
+// emphasizes that food and dims the rest, across all charts inside #results
+// (main charts, swap-preview, projected-after). Click again to clear.
+let highlightIdx = null;
+
+function applyHighlight() {
+  const root = document.getElementById("results");
+  if (!root) return;
+  const h = highlightIdx;
+  root.querySelectorAll("[data-food]").forEach(el => {
+    const i = Number(el.dataset.food);
+    if (el.classList.contains("food-chip")) {
+      el.classList.toggle("chip-active", h !== null && i === h);
+      el.classList.toggle("chip-dim", h !== null && i !== h);
+    } else {
+      el.classList.toggle("seg-dim", h !== null && i !== h);   // svg segment
+    }
+  });
+}
+
+function onLegendClick(e) {
+  // A legend chip OR any per-food bar segment (both carry data-food).
+  const el = e.target.closest("[data-food]");
+  if (!el) return;
+  const i = Number(el.dataset.food);
+  highlightIdx = highlightIdx === i ? null : i;   // toggle off if re-clicked
+  applyHighlight();
+}
 
 // Read every meal row in the DOM into a [{foodIndex, grams}] list.
 // Each row stores its resolved food index in data-idx (set when the user
@@ -607,7 +638,7 @@ function renderResults() {
   let html = `
     <h2>Daily average over ${days} day${days > 1 ? "s" : ""}</h2>
     <p class="muted">${Math.round(daily.kcal)} kcal/day · Sodium ${Math.round(daily.na)} mg (${naPct}% of ${DAILY_VALUES.na.dv} mg limit)</p>
-    <div class="card">${foodLegend(meals)}<p class="muted" style="margin:0 0 4px">Hover any segment for the exact amount.</p></div>
+    <div class="card">${foodLegend(meals)}<p class="muted" style="margin:0 0 4px">Hover any segment for the exact amount. <strong>Click a food</strong> — in the legend or on any bar — to highlight it across every chart.</p></div>
     <div class="card"><h3>Macronutrients</h3>${macroPie(daily)}
       <h4 class="sub">Where each macro comes from</h4>${macroBars(meals, perFood, daily)}</div>
     <div class="card"><h3>Micronutrients vs. Daily Value</h3>${dvBars(MICRO_KEYS, daily, meals, perFood)}</div>
@@ -650,7 +681,9 @@ function renderResults() {
   html += `</div>`;
 
   results.innerHTML = html;
+  highlightIdx = null;          // fresh results start with nothing highlighted
   mountSwapExplorer(meals, days);
+  applyHighlight();
   results.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
@@ -737,6 +770,7 @@ function mountSwapExplorer(meals, days) {
       `${Math.round(newDaily.kcal)} kcal/day · Sodium ${naPct}% · nutrients at target: ${metDelta}</p>` +
       foodLegend(newMeals, "Foods in this scenario") +
       dvBars(MICRO_KEYS, newDaily, newMeals, perFood);
+    applyHighlight();    // keep any active highlight after the preview rebuilds
   }
   updatePreview();
 }
@@ -1222,6 +1256,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("clearAll").addEventListener("click", clearAll);
   document.getElementById("days").addEventListener("input", saveState);
   document.getElementById("calculate").addEventListener("click", runCalculate);
+  document.getElementById("results").addEventListener("click", onLegendClick);
   document.getElementById("saveDiet").addEventListener("click", saveCurrentDiet);
   document.getElementById("loadDiet").addEventListener("click", loadSavedDiet);
   document.getElementById("deleteDiet").addEventListener("click", deleteSavedDiet);

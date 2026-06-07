@@ -30,7 +30,9 @@ the others.
      colored segments showing how much each logged food contributes (so you can see
      e.g. that 87% of your protein is from the chicken, not just the protein total).
      Every food gets a consistent color (shared legend), and hovering any segment shows
-     the exact amount.
+     the exact amount. **Click a food in the legend** to highlight it across every
+     per-food chart at once (the rest dim out), so you can instantly see the effect a
+     single ingredient is having; click it again to clear.
    - the micronutrient bars (22 of them, including **choline** and
      **pantothenic acid / B5**) are shown as a % of their Daily Value, with a
      dashed **100% DV reference line** on every bar,

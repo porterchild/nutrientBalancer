@@ -85,6 +85,14 @@
   .food-legend { display:flex; flex-wrap:wrap; gap:6px 16px; align-items:center; }
   .food-legend .legend-title { width:100%; margin-bottom:2px; }
   .food-chip { font-size:.85rem; white-space:nowrap; }
+  /* click-to-highlight: chips are buttons; selecting one dims the other foods */
+  .food-chip[data-food] { cursor:pointer; padding:1px 5px; border-radius:6px;
+                          transition:background .12s, opacity .12s; }
+  .food-chip[data-food]:hover { background:#eef2ff; }
+  .food-chip.chip-active { background:#dbe4ff; box-shadow:inset 0 0 0 1px var(--accent); }
+  .food-chip.chip-dim { opacity:.4; }
+  svg .seg-dim { opacity:.16; transition:opacity .12s; }
+  svg rect[data-food] { cursor:pointer; }
   h4.sub { margin:16px 0 6px; font-size:.9rem; color:var(--muted); font-weight:600; }
   .swap-controls { display:flex; flex-direction:column; gap:10px; margin-bottom:6px; }
   .swap-ctl { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
