@@ -45,17 +45,13 @@ function dvFraction(daily, key) {
 }
 
 // ---------------------------------------------------------------------------
-// Optimizer
-//   Greedy iso-caloric swaps. For each candidate swap we replace a logged food
-//   with a database food at a calorie-matched serving (capped to a realistic
-//   amount), recompute the FULL daily totals, and score how much the swap
-//   closes the gap on deficient micronutrients without overshooting limits.
+// Recommendable-food pool & gap detection
+//   Which database foods are sensible to suggest, and which nutrients are below
+//   target. (The old greedy swap optimizer was removed; suggestions are now the
+//   per-nutrient "foods rich in …" lists built from this same pool.)
 // ---------------------------------------------------------------------------
 
-const MAX_SERVING_G = 250;     // realistic upper bound for a swapped-in food
-const MAX_SWAPS = 5;           // how many swaps to recommend
 const DEFICIT_EPS = 0.999;     // treat >=99.9% DV as "met"
-const SUM_KEYS = [...ALL_KEYS, "kcal"];
 
 // Foods you can LOG freely, but that make poor RECOMMENDATIONS — engineered/
 // fortified/prepared items (bars, fortified cereals, sweets, fast food) that
@@ -68,6 +64,7 @@ const EXCLUDED_GROUPS = new Set([
   "Fast Foods", "Meals, Entrees, and Side Dishes", "Snacks",
   "Restaurant Foods", "Branded Food Products Database",
   "Quality Control Materials", "Alcoholic Beverages",
+  "Sausages and Luncheon Meats", "American Indian/Alaska Native Foods",
 ]);
 const EXCLUDE_NAME_RE =
   /powder|dried|dehydrated|\bdry\b|\bflour\b|\bmeal\b|defatted|infant formula|formula,|leavening|, mix\b|\bmix,|formulated|fortified|concentrate|freeze[- ]dried|extract|bouillon|baby ?food/i;
@@ -75,6 +72,15 @@ const EXCLUDE_NAME_RE =
 // the generic dried/dry filter would wrongly drop them. For this culinary class
 // we only reject the truly processed forms (flour/meal/defatted/powder/paste).
 const NUTSEED_EXCLUDE_RE = /\bflour\b|\bmeal\b|defatted|powder|paste|\bmix\b/;
+// Never recommendable regardless of food class — the long tail of USDA entries
+// that are technically edible but bad "eat more of this" advice. Tested on the
+// lowercased name:
+//   - extracted oils / rendered fats (incl. "fish oil, …", "Fat, chicken")
+//   - mechanically separated meats; unusual organs (spleen, thymus, lung…)
+//   - unspecified-species lab entries ("… sp. …")
+//   - leavening-boosted "self-rising" grains (their calcium is an additive)
+//   - ethnographic one-offs ("… (Alaska Native)", "… (… Indians)")
+const OBSCURE_RE = /\boil\b|^fat,|external fat|separable fat|\bbackfat\b|\bfat only\b|\btallow\b|\bsuet\b|\blard\b|mechanically separated|\bspleen\b|\bthymus\b|\blungs?\b|\bpancreas\b|\bbrains?\b|sweetbread|\btestes\b|testicle|\bsp\.|self-rising|\bcured\b|sweetened|breadnut|meatless|restaurant|\balaska native\b|indians?\)/;
 
 // To keep recommendations to foods people actually eat (not grape leaves,
 // dandelion greens, lambsquarters, emu…), a candidate's primary food noun must
@@ -134,6 +140,7 @@ function isCommonFood(food) {
 
 function isRecommendable(food) {
   if (!(food.kcal > 0) || EXCLUDED_GROUPS.has(food.group) || !isCommonFood(food)) return false;
+  if (OBSCURE_RE.test(food._lc)) return false;   // oils, mech-separated, "sp." entries
   if (culinaryGroup(food) === "nuts & seeds") return !NUTSEED_EXCLUDE_RE.test(food._lc);
   return !EXCLUDE_NAME_RE.test(food.name);
 }
@@ -144,153 +151,13 @@ const SWAP_CANDIDATES = FOODS.reduce((a, f, i) => {
   return a;
 }, []);
 
-// total ± a food's contribution, returning a fresh object.
-function addScaled(total, idx, grams, sign) {
-  const f = FOODS[idx], factor = (grams / 100) * sign, out = {};
-  for (const k of SUM_KEYS) out[k] = total[k] + (f[k] || 0) * factor;
-  return out;
-}
-
-// Nutrients the optimizer tries to bring to 100%: micronutrients + the
-// essential amino acids (both have DV/requirement targets via dvFraction).
+// Nutrients with a reach-100% target: micronutrients + the essential amino acids
+// (both have DV/requirement targets via dvFraction).
 const TARGET_KEYS = [...MICRO_KEYS, ...AMINO_KEYS];
 
-// Penalty score for a daily profile: how far below target across all tracked
-// nutrients (capped), plus penalties for exceeding calorie target and sodium.
-function deficiencyScore(daily, days, kcalTarget) {
-  let score = 0;
-  for (const k of TARGET_KEYS) {
-    const frac = dvFraction(daily, k);
-    if (frac < 1) score += (1 - frac);          // reward closing the gap
-  }
-  // Sodium limit (per day): penalize going over.
-  const naFrac = daily.na / DAILY_VALUES.na.dv;
-  if (naFrac > 1) score += (naFrac - 1) * 2;
-  // Calorie budget: penalize drifting from target (soft).
-  if (kcalTarget > 0) {
-    const kcalDaily = daily.kcal;
-    score += Math.abs(kcalDaily - kcalTarget) / kcalTarget * 0.5;
-  }
-  return score;
-}
-
+// Tracked nutrients currently below target — drives the "foods rich in …" lists.
 function deficientTargets(daily) {
   return TARGET_KEYS.filter(k => dvFraction(daily, k) < DEFICIT_EPS);
-}
-
-// Describe a before→after change in terms of the gaps it actually closes: only
-// nutrients that were BELOW target, and only the portion of the shortfall
-// filled (capped at 100% so overshoot doesn't inflate the number). This matches
-// what the ranking rewards, so the label explains why a swap was suggested.
-function gapClosedGains(beforeDaily, afterDaily, limit = 2) {
-  return TARGET_KEYS
-    .map(k => {
-      const base = dvFraction(beforeDaily, k);
-      if (base >= DEFICIT_EPS) return null;                 // wasn't deficient
-      const closed = Math.min(dvFraction(afterDaily, k), 1) - base;
-      return closed > 0.01 ? { k, closed } : null;          // ignore trivial (<1%)
-    })
-    .filter(Boolean)
-    .sort((a, b) => b.closed - a.closed)
-    .slice(0, limit)
-    .map(g => `${DAILY_VALUES[g.k].label} +${Math.round(g.closed * 100)}%`);
-}
-
-// "Do no harm": coverage a swap GIVES UP, counting surplus down to a buffer
-// (BUFFER_CAP) so the optimizer won't gut a well-met, hard-to-get nutrient (e.g.
-// take vitamin D from 700% to 0%) just to nudge a couple of others. Returned in
-// the same units as the deficiency score and subtracted from a swap's gain.
-const BUFFER_CAP = 1.25;   // value coverage as "kept" up to 125% of target
-const LOSS_WEIGHT = 1.5;   // how heavily to weight lost coverage vs. gained
-function coverageLost(before, after) {
-  let lost = 0;
-  for (const k of TARGET_KEYS) {
-    const d = Math.min(dvFraction(before, k), BUFFER_CAP) - Math.min(dvFraction(after, k), BUFFER_CAP);
-    if (d > 0) lost += d;
-  }
-  return lost;
-}
-
-// Net benefit of a swap: how much it lowers the deficiency score, minus a
-// penalty for coverage it sacrifices. Higher is better; >0 means worth doing.
-// `beforeScore` is precomputed (it's constant across candidates in a loop).
-function swapBenefit(beforeDaily, beforeScore, afterDaily, days, kcalTarget) {
-  return beforeScore - deficiencyScore(afterDaily, days, kcalTarget)
-    - LOSS_WEIGHT * coverageLost(beforeDaily, afterDaily);
-}
-
-// Produce a sequence of recommended swaps. Returns { swaps, finalMeals }.
-function optimize(baseMeals, days) {
-  let working = baseMeals.map(m => ({ ...m }));
-  let total = totals(working);                       // running totals (whole period)
-  const kcalTarget = total.kcal / days;              // keep daily calories steady
-  const swaps = [];
-  const swapped = new Set();                         // logged positions already swapped
-
-  for (let step = 0; step < MAX_SWAPS; step++) {
-    const dailyNow = perDay(total, days);
-    if (deficientTargets(dailyNow).length === 0) break;
-    const scoreNow = deficiencyScore(dailyNow, days, kcalTarget);
-
-    let best = null; // { mealPos, addIdx, addGrams, benefit }
-
-    for (let pos = 0; pos < working.length; pos++) {
-      if (swapped.has(pos)) continue;  // each logged food is swapped at most once
-      const item = working[pos];
-      const removedKcal = (FOODS[item.foodIndex].kcal * item.grams) / 100;
-      // totals with this logged item removed (computed once per position).
-      const without = addScaled(total, item.foodIndex, item.grams, -1);
-
-      for (const addIdx of SWAP_CANDIDATES) {
-        if (addIdx === item.foodIndex) continue;
-        const addFood = FOODS[addIdx];
-
-        // Calorie-matched serving, capped to a realistic amount.
-        let grams = removedKcal > 0 ? (removedKcal / addFood.kcal) * 100 : 100;
-        grams = Math.max(20, Math.min(MAX_SERVING_G, grams));
-
-        const dailyTrial = perDay(addScaled(without, addIdx, grams, +1), days);
-        const benefit = swapBenefit(dailyNow, scoreNow, dailyTrial, days, kcalTarget);
-
-        if (benefit > 1e-6 && (!best || benefit > best.benefit)) {
-          best = { mealPos: pos, addIdx, addGrams: grams, benefit };
-        }
-      }
-    }
-
-    if (!best) break; // no swap improves things further
-
-    const removed = working[best.mealPos];
-    const beforeDaily = perDay(total, days);
-    total = addScaled(addScaled(total, removed.foodIndex, removed.grams, -1),
-                      best.addIdx, best.addGrams, +1);
-    working[best.mealPos] = { foodIndex: best.addIdx, grams: best.addGrams };
-    swapped.add(best.mealPos);
-    const afterDaily = perDay(total, days);
-
-    swaps.push({
-      removeFood: FOODS[removed.foodIndex].name,
-      removeGrams: Math.round(removed.grams),
-      addFood: FOODS[best.addIdx].name,
-      addGrams: Math.round(best.addGrams),
-      before: beforeDaily,
-      after: afterDaily,
-    });
-  }
-
-  return { swaps, finalMeals: working };
-}
-
-// A food's "nutrient signature" = its 3 richest micronutrients (per 100 g, as a
-// fraction of DV). Foods sharing a signature are near-duplicates for swap
-// purposes (e.g. every animal liver is B12/A/copper), so we dedupe on it to
-// keep the replacement list diverse.
-function foodSig(food) {
-  if (food._sig) return food._sig;
-  const ranked = MICRO_KEYS
-    .map(k => [k, (food[k] || 0) / DAILY_VALUES[k].dv])
-    .sort((a, b) => b[1] - a[1]);
-  return (food._sig = ranked.slice(0, 2).map(x => x[0]).sort().join(","));
 }
 
 // Culinary class for "recipe-sensible" swaps — mostly the USDA food group, but
@@ -314,71 +181,74 @@ function recipeKey(food) {
   return segs.slice(0, 2).join(",");
 }
 
-// Top-N calorie-matched replacements for the food at `pos`, ranked by how much
-// each improves the WHOLE-diet balance (other foods held fixed). The first ~7
-// slots are the best diverse picks (deduped by nutrient signature); the LAST 3
-// are reserved for "recipe-sensible" swaps in the same culinary class as the
-// food being replaced (e.g. cheddar → cottage cheese, peanut butter → almonds).
-function topReplacements(meals, pos, days, n = 10) {
-  const baseTotal = totals(meals);
-  const baseDaily = perDay(baseTotal, days);
-  const kcalTarget = baseTotal.kcal / days;
-  const scoreNow = deficiencyScore(baseDaily, days, kcalTarget);
-  const item = meals[pos];
-  const removedKcal = (FOODS[item.foodIndex].kcal * item.grams) / 100;
-  const without = addScaled(baseTotal, item.foodIndex, item.grams, -1);
-  const origGroup = culinaryGroup(FOODS[item.foodIndex]);
+// The food "family" used to diversify suggestions = its leading noun, normalized
+// for plural/singular ("Mushrooms," / "Mushroom," → mushroom; "Nuts, …" → nut;
+// "Seeds, …" → seed). Broad enough that all mushroom cultivars collapse to one,
+// but fine enough that nuts and seeds stay distinct — so vitamin E surfaces both
+// almonds AND sunflower seeds, not just one of them (which the USDA food group,
+// "Nut and Seed Products", would have merged).
+// Animal-flesh groups — used to tell an organ meat ("Beef, …, kidney") from a
+// same-named plant ("Beans, kidney"; "Hearts of palm").
+const ANIMAL_GROUPS = new Set([
+  "Beef Products", "Pork Products", "Poultry Products",
+  "Lamb, Veal, and Game Products", "Finfish and Shellfish Products",
+]);
 
-  const cands = [];
-  for (const addIdx of SWAP_CANDIDATES) {
-    if (addIdx === item.foodIndex) continue;
-    let grams = removedKcal > 0 ? (removedKcal / FOODS[addIdx].kcal) * 100 : 100;
-    grams = Math.max(20, Math.min(MAX_SERVING_G, grams));
-    const trialDaily = perDay(addScaled(without, addIdx, grams, +1), days);
-    const improvement = swapBenefit(baseDaily, scoreNow, trialDaily, days, kcalTarget);
-    cands.push({ addIdx, grams, improvement });
+function familyKey(food) {
+  const lc = food._lc || (food._lc = food.name.toLowerCase());
+  // Organ meats group by ORGAN, not animal — otherwise B12/iron return seven
+  // livers (beef, lamb, duck, …). One liver then represents them all. Gated to
+  // animal groups so "kidney beans" / "hearts of palm" aren't mistaken for organs.
+  if (ANIMAL_GROUPS.has(food.group)) {
+    const organ = lc.match(/\b(liver|kidney|heart|gizzard|giblet|tripe|tongue)s?\b/);
+    if (organ) return organ[1];   // capture is singular; the optional s is outside it
   }
-  cands.sort((a, b) => b.improvement - a.improvement);
+  const segs = food._segs || (food._segs = lc.split(",").map(s => s.trim()));
+  let n = segs[0];
+  if (n.endsWith("ies")) n = n.slice(0, -3) + "y";        // berries → berry
+  else if (n.length > 3 && n.endsWith("s")) n = n.slice(0, -1);  // seeds → seed
+  return n;
+}
 
-  const nRecipe = 3, nGlobal = n - nRecipe;
-  const seenSig = new Set(), seenIdx = new Set();
-
-  // Global phase: best diverse picks (signature dedup).
-  const global = [];
-  for (const cand of cands) {
-    if (global.length >= nGlobal) break;
-    const sig = foodSig(FOODS[cand.addIdx]);
-    if (seenSig.has(sig)) continue;
-    seenSig.add(sig); seenIdx.add(cand.addIdx); global.push(cand);
+// The `n` recommendable whole foods richest in `key` per 100 g (as a fraction of
+// its DV), spread across DIFFERENT food families for variety. Uses the same
+// SWAP_CANDIDATES pool, so non-foods (oils, powders, fortified junk) are already
+// excluded.
+function topFoodsFor(key, n = 5) {
+  const dv = DAILY_VALUES[key].dv;
+  if (!dv) return [];
+  const ranked = [];
+  for (const idx of SWAP_CANDIDATES) {
+    const v = FOODS[idx][key] || 0;
+    if (v > 0) ranked.push({ idx, frac: v / dv });
   }
+  ranked.sort((a, b) => b.frac - a.frac);
 
-  // Recipe phase: improving swaps in the same culinary class, distinct foods.
-  const recipe = [], seenRecipe = new Set();
-  for (const cand of cands) {
-    if (recipe.length >= nRecipe) break;
-    if (cand.improvement <= 0 || seenIdx.has(cand.addIdx)) continue;
-    if (culinaryGroup(FOODS[cand.addIdx]) !== origGroup) continue;
-    const rk = recipeKey(FOODS[cand.addIdx]);
-    if (seenRecipe.has(rk)) continue;
-    seenRecipe.add(rk); seenIdx.add(cand.addIdx);
-    recipe.push({ ...cand, recipe: true });
+  // First pass: at most one food per family (so mushrooms, fish, milk, … not
+  // five mushrooms).
+  const out = [], seenFam = new Set();
+  for (const cand of ranked) {
+    if (out.length >= n) break;
+    const fam = familyKey(FOODS[cand.idx]);
+    if (seenFam.has(fam)) continue;
+    seenFam.add(fam);
+    out.push(cand);
   }
-
-  // Backfill global if recipe came up short, so the list stays ~n long.
-  for (const cand of cands) {
-    if (global.length + recipe.length >= n) break;
-    const sig = foodSig(FOODS[cand.addIdx]);
-    if (seenSig.has(sig) || seenIdx.has(cand.addIdx)) continue;
-    seenSig.add(sig); seenIdx.add(cand.addIdx); global.push(cand);
+  // Second pass: if there weren't n distinct families, backfill with the next
+  // best foods (deduped by recipeKey so we never repeat the exact same prep).
+  if (out.length < n) {
+    const chosen = new Set(out.map(c => c.idx));
+    const seenRk = new Set(out.map(c => recipeKey(FOODS[c.idx])));
+    for (const cand of ranked) {
+      if (out.length >= n) break;
+      if (chosen.has(cand.idx)) continue;
+      const rk = recipeKey(FOODS[cand.idx]);
+      if (seenRk.has(rk)) continue;
+      seenRk.add(rk);
+      out.push(cand);
+    }
   }
-
-  const result = [...global, ...recipe];
-  // Annotate each with the deficient-nutrient gaps it closes most (why it ranks).
-  for (const cand of result) {
-    const trialDaily = perDay(addScaled(without, cand.addIdx, cand.grams, +1), days);
-    cand.gainText = gapClosedGains(baseDaily, trialDaily, 2).join(", ");
-  }
-  return result;
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -400,19 +270,6 @@ function perFoodContribs(mealList, days) {
     for (const k of [...ALL_KEYS, "kcal"]) o[k] = c[k] / days;
     return o;
   });
-}
-
-// Shared color legend mapping each food to its swatch.
-function foodLegend(mealList, title = "Your foods (chart colors)") {
-  const titleHtml = title ? `<div class="legend-title">${title}</div>` : "";
-  const rows = mealList.map((m, i) => {
-    const amt = m.mult > 1
-      ? `${Math.round(m.baseGrams)} g ×${m.mult} = ${Math.round(m.grams)} g`
-      : `${Math.round(m.grams)} g`;
-    return `<span class="food-chip" data-food="${i}" title="click to highlight this food across the charts"><span class="swatch" style="background:${colorFor(i)}"></span>` +
-      `${escapeHtml(FOODS[m.foodIndex].name)} <span class="muted">(${amt})</span></span>`;
-  }).join("");
-  return `<div class="food-legend">${titleHtml}${rows}</div>`;
 }
 
 // Stacked horizontal bars showing each food's share of every macro (in grams).
@@ -658,6 +515,29 @@ function runCalculate() {
   requestAnimationFrame(() => requestAnimationFrame(renderResults));
 }
 
+// For every nutrient below target, list five whole foods proportionally highest
+// in it — a "go eat more of these" companion to the bar chart. Worst gaps first.
+function richFoodsCard(daily) {
+  const lows = deficientTargets(daily).slice()
+    .sort((a, b) => dvFraction(daily, a) - dvFraction(daily, b));
+  if (!lows.length) return "";
+  let rows = "";
+  for (const k of lows) {
+    const foods = topFoodsFor(k, 10);
+    if (!foods.length) continue;
+    const chips = foods.map(({ idx, frac }) =>
+      `<span class="rich-food">${escapeHtml(FOODS[idx].name)} <span class="muted">${Math.round(frac * 100)}%</span></span>`
+    ).join("");
+    rows += `<tr><td class="rich-nut">${DAILY_VALUES[k].label}` +
+            `<br><span class="muted">${Math.round(dvFraction(daily, k) * 100)}% now</span></td>` +
+            `<td class="rich-list">${chips}</td></tr>`;
+  }
+  if (!rows) return "";
+  return `<div class="card"><h3>Foods rich in the nutrients you're low on</h3>
+    <p class="muted">For each nutrient below 100% of target, five whole foods proportionally highest in it — shown as % of the Daily Value per 100 g. Add ones you like to your meals above.</p>
+    <table class="rich-table">${rows}</table></div>`;
+}
+
 function renderResults() {
   const days = Math.max(1, Number(document.getElementById("days").value) || 1);
   const meals = collectMeals();
@@ -698,131 +578,12 @@ function renderResults() {
       <p class="muted" style="margin:8px 0 0">Omega-3/6 use IOM Adequate Intakes (no FDA Daily Value exists); saturated fat, cholesterol &amp; sodium are upper limits.</p></div>
     <div class="card"><h3>Carotenoids (phytonutrients)</h3>${HINT}${stackedNutrientBars(CAROT_KEYS, meals, perFood, daily)}
       <p class="muted" style="margin:8px 0 0">No Daily Value exists for these; shown as amounts. Beta-carotene also counts toward vitamin A (already included above).</p></div>
-    <div class="card" id="swapExplorer"></div>`;
-
-  // Optimizer
-  const deficient = deficientTargets(daily);
-  html += `<div class="card"><h3>Recommendations</h3>`;
-  if (deficient.length === 0) {
-    html += `<p class="ok">🎉 You're at or above target for all tracked micronutrients and amino acids. Nice balance!</p>`;
-  } else {
-    html += `<p>Below target: <strong>${deficient.map(k => DAILY_VALUES[k].label).join(", ")}</strong>.</p>`;
-    const { swaps, finalMeals } = optimize(meals, days);
-    if (swaps.length === 0) {
-      html += `<p class="muted">No single-food swap in the database improves your coverage without overshooting calorie/sodium limits. Consider adding a serving of a nutrient-dense food (e.g. beef liver, oysters, sardines, spinach, pumpkin seeds, fortified cereal).</p>`;
-    } else {
-      html += `<p>Suggested calorie-matched swaps (applied in order, recomputing totals each time):</p><ol class="swaps">`;
-      for (const s of swaps) {
-        const gains = gapClosedGains(s.before, s.after, 4).join(", ");
-        html += `<li>Swap <strong>${s.removeGrams} g ${s.removeFood}</strong> →
-                 <strong>${s.addGrams} g ${s.addFood}</strong>
-                 ${gains ? `<br><span class="muted">gains: ${gains}</span>` : ""}</li>`;
-      }
-      html += `</ol>`;
-      const finalDaily = perDay(totals(finalMeals), days);
-      const finalPerFood = perFoodContribs(finalMeals, days);
-      const stillLow = deficientTargets(finalDaily);
-      html += `<p class="muted">After these swaps: ${TARGET_KEYS.length - stillLow.length}/${TARGET_KEYS.length} nutrients at 100%+ target` +
-        (stillLow.length ? `; still low: ${stillLow.map(k => DAILY_VALUES[k].label).join(", ")}.` : `. All targets met!`) + `</p>`;
-      html += `<details><summary>Projected micronutrient chart after swaps</summary>` +
-        `${HINT}${foodLegend(finalMeals, "Foods after swaps")}${dvBars(MICRO_KEYS, finalDaily, finalMeals, finalPerFood)}</details>`;
-    }
-  }
-  html += `</div>`;
+    ${richFoodsCard(daily)}`;
 
   results.innerHTML = html;
   highlightIdx = null;          // fresh results start with nothing highlighted
-  mountSwapExplorer(meals, days);
   applyHighlight();
   results.scrollIntoView({ behavior: "smooth", block: "start" });
-}
-
-// Interactive "What If I Swapped" explorer: a replacement dropdown per food and
-// a live balance preview that updates as the user combines choices.
-function mountSwapExplorer(meals, days) {
-  const box = document.getElementById("swapExplorer");
-  if (!box) return;
-  const baseDaily = perDay(totals(meals), days);
-  const baseMet = TARGET_KEYS.length - deficientTargets(baseDaily).length;
-  const selection = {};                       // pos -> { addIdx, grams } or absent
-  const customByPos = {};                     // pos -> last food picked via search
-  const replacementsByPos = meals.map((_, pos) => topReplacements(meals, pos, days, 10));
-
-  box.innerHTML = `<h3>What If I Swapped…</h3>
-    <p class="muted">Pick from the top-10 suggestions <em>or</em> search any food to try it. Combine as many as you like — calorie-matched servings.</p>
-    <div class="swap-controls"></div>
-    <div class="swap-preview"></div>`;
-  const controls = box.querySelector(".swap-controls");
-  const preview = box.querySelector(".swap-preview");
-
-  // Calorie-matched serving for replacing the logged food at `pos`.
-  const matchGrams = (pos, addIdx) => {
-    const removedKcal = (FOODS[meals[pos].foodIndex].kcal * meals[pos].grams) / 100;
-    const g = removedKcal > 0 ? (removedKcal / FOODS[addIdx].kcal) * 100 : 100;
-    return Math.max(20, Math.min(MAX_SERVING_G, g));
-  };
-
-  meals.forEach((m, pos) => {
-    const ctl = document.createElement("div");
-    ctl.className = "swap-ctl";
-    const reps = replacementsByPos[pos];
-    const optOf = (c, i) =>
-      `<option value="${i}">→ ${escapeHtml(FOODS[c.addIdx].name)} (${Math.round(c.grams)} g)` +
-      `${c.gainText ? ` · ${c.gainText}` : ""}</option>`;
-    const globalOpts = reps.map((c, i) => ({ c, i })).filter(x => !x.c.recipe).map(x => optOf(x.c, x.i)).join("");
-    const recipeOpts = reps.map((c, i) => ({ c, i })).filter(x => x.c.recipe).map(x => optOf(x.c, x.i)).join("");
-    ctl.innerHTML =
-      `<span class="swatch" style="background:${colorFor(pos)}"></span>` +
-      `<select class="swap-select" data-pos="${pos}">` +
-        `<option value="">Keep — ${escapeHtml(FOODS[m.foodIndex].name)} (${Math.round(m.grams)} g)</option>` +
-        `<optgroup label="Best for your gaps">${globalOpts}</optgroup>` +
-        (recipeOpts ? `<optgroup label="Similar foods (recipe-friendly)">${recipeOpts}</optgroup>` : "") +
-      `</select>`;
-    const sel = ctl.querySelector("select");
-
-    // Search box: try ANY food. A pick adds/updates a "✎ custom" option on the
-    // select and selects it, so the dropdown reflects the active choice and you
-    // can still revert to "Keep" or a top-10 option.
-    const searcher = buildFoodSearch(addIdx => {
-      const grams = matchGrams(pos, addIdx);
-      customByPos[pos] = { addIdx, grams };
-      let opt = [...sel.options].find(o => o.value === "c");
-      if (!opt) { opt = document.createElement("option"); opt.value = "c"; sel.appendChild(opt); }
-      opt.textContent = `✎ ${FOODS[addIdx].name} (${Math.round(grams)} g)`;
-      sel.value = "c";
-      selection[pos] = customByPos[pos];
-      updatePreview();
-    });
-    ctl.appendChild(searcher.wrap);
-    controls.appendChild(ctl);
-
-    sel.addEventListener("change", e => {
-      const v = e.target.value;
-      if (v === "") delete selection[pos];
-      else if (v === "c") selection[pos] = customByPos[pos];
-      else selection[pos] = replacementsByPos[pos][Number(v)];
-      updatePreview();
-    });
-  });
-
-  function updatePreview() {
-    const newMeals = meals.map((m, i) =>
-      selection[i] ? { foodIndex: selection[i].addIdx, grams: selection[i].grams } : m);
-    const newDaily = perDay(totals(newMeals), days);
-    const perFood = perFoodContribs(newMeals, days);
-    const met = TARGET_KEYS.length - deficientTargets(newDaily).length;
-    const nSwaps = Object.keys(selection).length;
-    const naPct = Math.round(newDaily.na / DAILY_VALUES.na.dv * 100);
-    const metDelta = met === baseMet ? `${met}/${TARGET_KEYS.length}`
-      : `${baseMet} → <strong>${met}</strong>/${TARGET_KEYS.length}`;
-    preview.innerHTML =
-      `<p class="muted" style="margin:14px 0 6px">${nSwaps ? `Previewing ${nSwaps} swap${nSwaps > 1 ? "s" : ""}` : "No swaps selected (showing your current balance)"} — ` +
-      `${Math.round(newDaily.kcal)} kcal/day · Sodium ${naPct}% · nutrients at target: ${metDelta}</p>` +
-      `<h4 class="hint">Hover for info and Click to focus</h4>` +
-      dvBars(MICRO_KEYS, newDaily, newMeals, perFood);
-    applyHighlight();    // keep any active highlight after the preview rebuilds
-  }
-  updatePreview();
 }
 
 // "Compare two ingredients" — pick two foods (with serving sizes) and see their
